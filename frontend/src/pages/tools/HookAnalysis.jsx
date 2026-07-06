@@ -222,7 +222,7 @@ export default function ToolHookAnalysis() {
       ) : null}
     >
       <Typography variant="body2" sx={{ color: "text.secondary" }}>
-        Upload a video. ViralMint trims the first 10 seconds, transcribes
+        Upload a video. Content Engine trims the first 10 seconds, transcribes
         the audio, and asks AI to score the opening hook plus suggest 3
         stronger alternatives. Best for short-form content where the first
         3 seconds decide whether viewers stay.

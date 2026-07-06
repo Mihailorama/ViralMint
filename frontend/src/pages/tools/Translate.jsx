@@ -224,7 +224,7 @@ export default function ToolTranslate() {
           {mode === "full_dub" ? (
             <>
               The dubbed voiceover may run slightly longer or shorter than the original audio.
-              ViralMint applies a small speed-up (up to 1.15×) to fit; beyond that the original
+              Content Engine applies a small speed-up (up to 1.15×) to fit; beyond that the original
               video duration wins and any extra dub at the end is trimmed.
             </>
           ) : (

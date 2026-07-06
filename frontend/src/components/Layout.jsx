@@ -127,7 +127,7 @@ export default function Layout() {
           <Box
             component="img"
             src="/icon-192.png"
-            alt="ViralMint"
+            alt="Content Engine"
             sx={{ width: 32, height: 32, borderRadius: 1, flexShrink: 0 }}
           />
           {(!collapsed || isNarrow) && (
@@ -143,7 +143,7 @@ export default function Layout() {
                 whiteSpace: "nowrap",
               }}
             >
-              ViralMint
+              Content Engine
             </Typography>
           )}
         </Box>
@@ -256,7 +256,7 @@ export default function Layout() {
                 WebkitTextFillColor: "transparent",
               }}
             >
-              ViralMint
+              Content Engine
             </Typography>
           </Box>
         )}

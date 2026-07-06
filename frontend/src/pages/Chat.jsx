@@ -363,7 +363,7 @@ export default function Chat() {
                   WebkitTextFillColor: "transparent",
                 }}
               >
-                ViralMint
+                Content Engine
               </Typography>
               <Typography
                 variant="body1"

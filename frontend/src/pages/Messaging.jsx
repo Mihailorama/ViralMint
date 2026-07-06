@@ -449,7 +449,7 @@ export default function Messaging() {
               Messaging
             </Typography>
             <Typography variant="caption" sx={{ color: "text.secondary" }}>
-              Connect a messaging app to control ViralMint from your phone and receive job notifications
+              Connect a messaging app to control Content Engine from your phone and receive job notifications
             </Typography>
           </Box>
         </Stack>
@@ -472,7 +472,7 @@ export default function Messaging() {
             <Box sx={{ flex: 1 }}>
               <Typography variant="h6" sx={{ fontWeight: 600 }}>Telegram</Typography>
               <Typography variant="caption" color="text.secondary">
-                Two-way chat with your ViralMint planner and job notifications
+                Two-way chat with your Content Engine planner and job notifications
               </Typography>
             </Box>
             {statusChip()}
@@ -631,7 +631,7 @@ export default function Messaging() {
           {(waState === WA_STATE.DISCONNECTED || waState === WA_STATE.PAIRING) && (
             <Stack spacing={2}>
               <Typography variant="body2" color="text.secondary">
-                Get scout, download, and upload alerts on WhatsApp — and chat with ViralMint
+                Get scout, download, and upload alerts on WhatsApp — and chat with Content Engine
                 straight from your phone. Pairs in seconds, just like WhatsApp Web.
               </Typography>
               <Typography variant="body2" color="text.secondary">

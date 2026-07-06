@@ -167,7 +167,7 @@ export default function AIProviderSection({ settings, updateSettings }) {
           <DialogTitle>Remove API key?</DialogTitle>
           <DialogContent>
             <Typography variant="body2">
-              This deletes the encrypted key from your local database. ViralMint will fall back to
+              This deletes the encrypted key from your local database. Content Engine will fall back to
               the {PROVIDER_LABEL[settings.ai_provider]} key in your <code>.env</code> file (if set).
               If neither is configured, AI features will stop working until you add a new key.
             </Typography>

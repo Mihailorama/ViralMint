@@ -16,7 +16,9 @@
 #
 # Output: desktop/release/ with .dmg + .zip on macOS, .tar.gz on Linux.
 #
-# This is the OSS smoke-test build — single binary, no tray, browser is the UI.
+# The OSS build — one binary whose entry point is the launcher.py system-tray
+# app; it re-invokes itself with --run-backend to run uvicorn, and the user's
+# browser is the UI.
 
 set -euo pipefail
 
@@ -169,10 +171,12 @@ case "$PLATFORM" in
     (cd dist && ditto -c -k --keepParent "ViralMint.app" "$RELEASE_DIR/$ZIP_NAME")
 
     DMG_NAME="ViralMint-${VERSION}-mac.dmg"
+    VOLICON="$REPO_ROOT/desktop/build/icon.icns"   # generated from icon.png above
     if command -v create-dmg >/dev/null 2>&1; then
       echo "==> Building DMG via create-dmg"
       create-dmg \
         --volname "ViralMint" \
+        ${VOLICON:+--volicon "$VOLICON"} \
         --window-size 600 400 \
         --icon-size 100 \
         --icon "ViralMint.app" 150 200 \
@@ -180,12 +184,46 @@ case "$PLATFORM" in
         "$RELEASE_DIR/$DMG_NAME" \
         "$APP_PATH" || true
     else
-      echo "==> Building DMG via hdiutil"
+      echo "==> Building DMG via hdiutil (with ViralMint volume icon)"
       STAGING=$(mktemp -d)
       cp -R "$APP_PATH" "$STAGING/"
       ln -s /Applications "$STAGING/Applications"
-      hdiutil create -volname "ViralMint" -srcfolder "$STAGING" \
-        -ov -format UDZO "$RELEASE_DIR/$DMG_NAME"
+      # Give the mounted installer volume the ViralMint icon: drop
+      # .VolumeIcon.icns at the volume root and set the volume's custom-icon
+      # flag so Finder shows the logo instead of the generic disk icon.
+      if [[ -f "$VOLICON" ]]; then
+        cp "$VOLICON" "$STAGING/.VolumeIcon.icns"
+      fi
+      TMP_DMG="$(mktemp -u).dmg"
+      # hdiutil on GitHub's macOS runners intermittently fails with
+      # "Resource temporarily unavailable" (a busy disk-image helper), which
+      # once failed a release build that was otherwise green. Retry the two
+      # image-writing steps with a short backoff; a real error still fails.
+      hdiutil_retry() {
+        local attempt
+        for attempt in 1 2 3 4 5; do
+          if hdiutil "$@" >/dev/null; then return 0; fi
+          echo "    hdiutil $1 failed (attempt $attempt/5), retrying in $((attempt * 5))s" >&2
+          sleep $((attempt * 5))
+        done
+        echo "ERROR: hdiutil $1 failed after 5 attempts" >&2
+        return 1
+      }
+      hdiutil_retry create -volname "ViralMint" -srcfolder "$STAGING" \
+        -ov -format UDRW "$TMP_DMG"
+      if [[ -f "$VOLICON" ]]; then
+        MNT="$(mktemp -d)"
+        if hdiutil attach "$TMP_DMG" -nobrowse -noautoopen -mountpoint "$MNT" >/dev/null; then
+          # SetFile (Xcode CLT) marks the volume as having a custom icon.
+          if command -v SetFile >/dev/null 2>&1; then SetFile -a C "$MNT" || true
+          elif xcrun --find SetFile >/dev/null 2>&1; then xcrun SetFile -a C "$MNT" || true
+          fi
+          hdiutil detach "$MNT" >/dev/null 2>&1 || hdiutil detach "$MNT" -force >/dev/null 2>&1 || true
+        fi
+        rm -rf "$MNT"
+      fi
+      hdiutil_retry convert "$TMP_DMG" -ov -format UDZO -o "$RELEASE_DIR/$DMG_NAME"
+      rm -f "$TMP_DMG"
       rm -rf "$STAGING"
     fi
     ;;

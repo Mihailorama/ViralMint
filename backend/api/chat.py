@@ -12,6 +12,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.user_settings import UserSettings
 from backend.models.chat_session import ChatSession, ChatMessage as ChatMessageModel
 from backend.core.ws_manager import ws_manager
+from backend.core.chat_history import CHAT_SESSION
 from backend.core.user_intelligence import UserIntelligence
 from backend.agents.planner import PlannerAgent
 
@@ -126,6 +127,19 @@ async def _maybe_update_profile(user_id: str):
 @router.websocket("/ws/chat")
 async def chat_websocket(websocket: WebSocket):
     user_id = "local"
+    # The HTTP CSRF middleware never sees a websocket scope, so any page the
+    # user happens to have open could connect here, drive the planner (real
+    # dispatched jobs, `job_cancel` on the user's own work) and read every
+    # event the app streams. Same allowlist, same rule as the middleware: a
+    # PRESENT Origin must be ours; no Origin is a non-browser client
+    # (messaging bridge, tests, CLI) and still passes. Closing before accept
+    # answers the handshake with a refusal rather than an open socket.
+    from backend.core.origins import lan_mode, origin_ok
+    origin = websocket.headers.get("origin")
+    if origin and not lan_mode() and not origin_ok(origin):
+        logger.warning("Rejected /ws/chat handshake from foreign origin %r", origin[:120])
+        await websocket.close(code=1008)
+        return
     await ws_manager.connect(websocket, user_id)
 
     # Load user settings
@@ -160,6 +174,9 @@ async def chat_websocket(websocket: WebSocket):
             if msg_type == "set_session":
                 # Frontend tells us which session to use
                 current_session_id = msg.get("session_id")
+                # Attribute backend-persisted rich cards / job rows to this
+                # session (rides asyncio context into dispatched jobs).
+                CHAT_SESSION.set(current_session_id)
                 logger.info(f"Session set to: {current_session_id}")
 
             elif msg_type == "chat_message":
@@ -181,6 +198,12 @@ async def chat_websocket(websocket: WebSocket):
                         "session_id": session.id,
                         "title": session.title,
                     }, user_id)
+
+                # Attribute everything this turn emits (planner rich cards,
+                # jobs it dispatches) to the active session. Dispatched jobs
+                # snapshot this context, so results that land after the turn
+                # returns still persist into the right session.
+                CHAT_SESSION.set(current_session_id)
 
                 # Persist user message
                 await _persist_message(current_session_id, "user", content=content, user_id=user_id)
@@ -255,8 +278,12 @@ async def chat_websocket(websocket: WebSocket):
             elif msg_type == "job_cancel":
                 job_id = msg.get("job_id")
                 if job_id:
-                    from backend.agents.job_helper import update_job_status
-                    await update_job_status(job_id, "cancelled")
+                    # Conditional: only a job that is still live is cancelled.
+                    # update_job_status allows terminal→terminal writes (the
+                    # boot sweep self-heals through them), so a late cancel
+                    # used to rewrite an already-finished job as "cancelled".
+                    from backend.agents.job_helper import cancel_if_live
+                    await cancel_if_live(job_id)
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, user_id)

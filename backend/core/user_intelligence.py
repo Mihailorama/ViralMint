@@ -14,6 +14,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.user_behavior import UserBehavior
 from backend.models.user_settings import UserSettings
 from backend.models.user_profile import UserProfile
+from backend.core.prompt_rules import extract_json_text
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ class UserIntelligence:
 
             # Parse and validate JSON
             cleaned = response.strip()
+            cleaned = extract_json_text(cleaned)  # fence anywhere / leading prose (prompt_rules)
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             profile_data = json.loads(cleaned)
@@ -401,6 +403,7 @@ Return a JSON array of 3 strings. No explanation."""
                 max_tokens=256,
             )
             cleaned = response.strip()
+            cleaned = extract_json_text(cleaned)  # fence anywhere / leading prose (prompt_rules)
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             suggestions = json.loads(cleaned)
@@ -511,10 +514,15 @@ Return a JSON array of 3 strings. No explanation."""
         from backend.config import settings as env
 
         # All keys are BYOK from .env (or per-user UserSettings for AI provider).
-        ai_user_key = bool(user_settings and user_settings.ai_api_key_encrypted)
+        from backend.core.ai_provider import _resolve_user_provider_and_key
+        user_provider, _ = _resolve_user_provider_and_key(user_settings)
         status = {
             "ai_provider": {
-                "configured": bool(env.ANTHROPIC_API_KEY or env.OPENAI_API_KEY or ai_user_key),
+                "configured": bool(
+                    user_provider
+                    or env.ANTHROPIC_API_KEY or env.OPENAI_API_KEY
+                    or env.OPENROUTER_API_KEY or env.CUSTOM_AI_BASE_URL
+                ),
             },
             "youtube_scout": {
                 "configured": bool(env.YOUTUBE_API_KEY),
@@ -692,6 +700,7 @@ Return ONLY the JSON array."""
                 max_tokens=1024,
             )
             cleaned = response.strip()
+            cleaned = extract_json_text(cleaned)  # fence anywhere / leading prose (prompt_rules)
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             calendar = json.loads(cleaned)

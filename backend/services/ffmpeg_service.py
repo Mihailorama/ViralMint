@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 from backend.config import settings
 from backend.core.exceptions import VideoGenerationError
-from backend.services.video_utils import probe_duration
+from backend.services.video_utils import cover_vf, ff_filter_path, probe_dimensions, probe_duration
 
 
 def _tmp(name: str) -> Path:
@@ -74,7 +74,7 @@ async def _stitch_concat(clip_paths: list[Path], output_path: Path) -> Path:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         concat_file.unlink(missing_ok=True)
         if result.returncode != 0:
-            raise VideoGenerationError(f"FFmpeg stitch failed: {result.stderr[:500]}")
+            raise VideoGenerationError(f"FFmpeg stitch failed: {ffmpeg_error(result.stderr, 500)}")
         return output_path
 
     return await asyncio.to_thread(_run)
@@ -132,7 +132,7 @@ async def _stitch_xfade(
         )
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
-            logger.warning(f"xfade stitch failed, falling back to concat: {result.stderr[:400]}")
+            logger.warning(f"xfade stitch failed, falling back to concat: {ffmpeg_error(result.stderr, 400)}")
             # Fallback to simple concat
             concat_file = _tmp("concat.txt")
             concat_file.parent.mkdir(parents=True, exist_ok=True)
@@ -149,7 +149,7 @@ async def _stitch_xfade(
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             concat_file.unlink(missing_ok=True)
             if result.returncode != 0:
-                raise VideoGenerationError(f"FFmpeg stitch failed: {result.stderr[:500]}")
+                raise VideoGenerationError(f"FFmpeg stitch failed: {ffmpeg_error(result.stderr, 500)}")
         return output_path
 
     return await asyncio.to_thread(_run)
@@ -176,7 +176,7 @@ async def add_audio_to_video(
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
-            raise VideoGenerationError(f"FFmpeg audio merge failed: {result.stderr[:500]}")
+            raise VideoGenerationError(f"FFmpeg audio merge failed: {ffmpeg_error(result.stderr, 500)}")
         return output_path
 
     return await asyncio.to_thread(_merge)
@@ -206,13 +206,13 @@ async def add_captions(
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_path),
-            "-vf", f"subtitles={srt_path}:force_style='FontSize={font_size},PrimaryColour=&Hffffff&,OutlineColour=&H000000&,Outline=2,Alignment=2'",
+            "-vf", f"subtitles={ff_filter_path(srt_path)}:force_style='FontSize={font_size},PrimaryColour=&Hffffff&,OutlineColour=&H000000&,Outline=2,Alignment=2'",
             "-c:a", "copy",
             str(output_path),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
-            logger.warning(f"FFmpeg captioning failed: {result.stderr[:300]}")
+            logger.warning(f"FFmpeg captioning failed: {ffmpeg_error(result.stderr)}")
             # Return original video without captions rather than failing
             return video_path
 
@@ -220,6 +220,29 @@ async def add_captions(
         return output_path
 
     return await asyncio.to_thread(_caption)
+
+
+def ffmpeg_error(stderr: str, limit: int = 400) -> str:
+    """The part of ffmpeg's stderr that says what went wrong.
+
+    ffmpeg prints ~200 characters of version banner and build configuration
+    BEFORE it says anything useful, so `stderr[:200]` logs a constant string
+    and throws the error away — every thumbnail failure logged the identical
+    "ffmpeg version 7.1 Copyright ... configuration: --prefix=" with no cause
+    attached.
+
+    Drops the banner and returns the tail, which is where the diagnosis lives
+    ("No such file or directory", "Invalid data found when processing input",
+    "moov atom not found").
+    """
+    if not stderr:
+        return "(no stderr)"
+    lines = [
+        ln for ln in stderr.splitlines()
+        if ln.strip() and not ln.startswith(("ffmpeg version", "  built with",
+                                             "  configuration:", "  lib"))
+    ]
+    return "\n".join(lines)[-limit:] if lines else stderr[-limit:]
 
 
 async def extract_thumbnail(
@@ -233,21 +256,65 @@ async def extract_thumbnail(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _extract():
+        # Temp-then-replace, and refuse an empty frame: this output is
+        # backfilled as a row's permanent thumbnail and served from the
+        # thumbnails cache, so a half-written or 0-byte JPEG at the final
+        # path is a broken image the Library keeps showing.
+        import uuid
+        tmp = output_path.with_name(
+            f"{output_path.stem}.{uuid.uuid4().hex[:8]}.tmp{output_path.suffix}")
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_path),
             "-ss", str(timestamp),
             "-vframes", "1",
             "-q:v", "2",
-            str(output_path),
+            str(tmp),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            logger.warning(f"Thumbnail extraction failed: {result.stderr[:200]}")
-            return None
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                logger.warning("Thumbnail extraction failed for %s: %s",
+                               video_path.name, ffmpeg_error(result.stderr))
+                return None
+            if not tmp.exists() or tmp.stat().st_size == 0:
+                logger.warning("Thumbnail extraction produced an empty file for %s",
+                               video_path.name)
+                return None
+            tmp.replace(output_path)
+        finally:
+            tmp.unlink(missing_ok=True)
         return output_path
 
     return await asyncio.to_thread(_extract)
+
+
+# Wall-clock budget for one clip cut, scaled to the CLIP's length — the work is
+# a full re-encode of `end - start`, so a constant could only ever be right for
+# one clip size. It was a flat 600s: fine for the 15-60s clips the Clipper
+# normally cuts, hopeless for a legitimately long manual range. Manual mode
+# enforces a MINIMUM length and caps the COUNT but never caps the length, so
+# "pull the six interview blocks out of this 6-hour recording" is a valid submit
+# — and it hit the wall on every window, then reported "All N clip extractions
+# failed … may indicate a corrupt source video", the wrong cause, after burning
+# an hour of CPU.
+#
+# Same shape as the caption burn budget and
+# clip_extractor._silence_removal_timeout: the floor keeps today's behaviour for
+# short clips, the factor is generous against observed realtime, and the ceiling
+# is a backstop rather than a budget.
+_CLIP_TIMEOUT_FLOOR_S = 600      # short clips: unchanged behaviour
+_CLIP_SECONDS_PER_SECOND = 4     # generous vs. observed re-encode realtime
+_CLIP_TIMEOUT_CEILING_S = 7200   # 2h backstop
+
+
+def _clip_timeout_for_duration(duration_s: float) -> int:
+    """Seconds to allow for one clip cut. Pure, so it is directly testable."""
+    if not duration_s or duration_s <= 0:
+        return _CLIP_TIMEOUT_FLOOR_S
+    return int(min(_CLIP_TIMEOUT_CEILING_S,
+                   max(_CLIP_TIMEOUT_FLOOR_S,
+                       duration_s * _CLIP_SECONDS_PER_SECOND)))
 
 
 async def extract_clip(
@@ -307,11 +374,17 @@ async def extract_clip(
                 str(output_path),
             ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            budget = _clip_timeout_for_duration(duration)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=budget)
         except subprocess.TimeoutExpired:
-            raise VideoGenerationError(f"Clip extraction timed out after 10 minutes (start={start:.1f}s, end={end:.1f}s)")
+            raise VideoGenerationError(
+                f"Clip extraction timed out after "
+                f"{_clip_timeout_for_duration(duration) // 60} minutes re-encoding "
+                f"a {duration:.0f}s clip (start={start:.1f}s, end={end:.1f}s). "
+                f"Cut it into shorter ranges and retry."
+            )
         if result.returncode != 0:
-            raise VideoGenerationError(f"Clip extraction failed: {result.stderr[:500]}")
+            raise VideoGenerationError(f"Clip extraction failed: {ffmpeg_error(result.stderr, 500)}")
         if not output_path.exists() or output_path.stat().st_size < 1000:
             raise VideoGenerationError(f"Clip extraction produced empty or invalid file: {output_path}")
         return output_path
@@ -429,7 +502,7 @@ async def generate_text_video(
             if result.returncode == 0 and clip_path.exists():
                 tmp_clips.append(clip_path)
             else:
-                logger.warning(f"Text clip {idx} failed: {result.stderr[:300]}")
+                logger.warning(f"Text clip {idx} failed: {ffmpeg_error(result.stderr, 300)}")
             img_path.unlink(missing_ok=True)
 
         if not tmp_clips:
@@ -451,7 +524,7 @@ async def generate_text_video(
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
-            raise VideoGenerationError(f"FFmpeg concat failed: {result.stderr[:300]}")
+            raise VideoGenerationError(f"FFmpeg concat failed: {ffmpeg_error(result.stderr, 300)}")
 
         # Merge audio if available
         if audio_path and audio_path.exists():
@@ -480,6 +553,135 @@ async def generate_text_video(
         return output_path
 
     return await asyncio.to_thread(_generate)
+
+
+# Longest edge a normalized still may keep. The Ken Burns chain scales it to
+# 2x the output frame anyway, so anything above this is decoded, held in
+# memory and thrown away — a 108 MP camera PNG is ~400 MB of RGB for ONE frame.
+MAX_STILL_DIMENSION = 4096
+
+
+def _capped_still_dimensions(width: int, height: int) -> tuple[int, int]:
+    """Scale (width, height) down so the longest edge fits MAX_STILL_DIMENSION,
+    preserving aspect. Dimensions stay even — odd ones break some encoders."""
+    longest = max(width, height)
+    if longest <= MAX_STILL_DIMENSION or longest <= 0:
+        out_w, out_h = width, height
+    else:
+        scale = MAX_STILL_DIMENSION / longest
+        out_w = max(2, int(width * scale))
+        out_h = max(2, int(height * scale))
+    return out_w - (out_w % 2), out_h - (out_h % 2)
+
+
+def _normalize_still_sync(src: Path, dst: Path) -> tuple[int, int]:
+    """Write ONE opaque, bounded, single-frame RGB PNG at `dst`.
+
+    Deliberately a single ffmpeg invocation over a black `color` source rather
+    than a straight transcode, because DROPPING an alpha channel and
+    COMPOSITING one are different operations and only the second is correct.
+    The Ken Burns chain ends on `format=yuv420p`, which discards alpha and
+    leaves whatever RGB happened to sit underneath — so a background-removed
+    cut-out rendered as a garbage-fringed subject with no error anywhere.
+    Probed on a white disc cut out over hidden green: the transparent field
+    came back (0, 127, 0) before this pass and (0, 0, 0) after.
+
+    Overlaying onto black is a no-op for the opaque images that are the common
+    case, so every still can take the same path. It also gives us frame 0 of
+    an animated GIF/WebP for free, and caps a camera-sized panorama before it
+    ever reaches zoompan.
+
+    Returns the normalized (width, height).
+    """
+    src, dst = Path(src), Path(dst)
+    width, height = probe_dimensions(src)
+    if width <= 0 or height <= 0:
+        raise VideoGenerationError(
+            f"Couldn't read that image: no still frame in {src.name}"
+        )
+
+    out_w, out_h = _capped_still_dimensions(width, height)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        # An infinite black canvas at the target size...
+        "-f", "lavfi", "-i", f"color=c=black:s={out_w}x{out_h}",
+        "-i", str(src),
+        "-filter_complex",
+        # ...with the (possibly transparent, possibly animated) source scaled
+        # onto it. `shortest` plus `-frames:v 1` together make this frame 0 of
+        # a GIF/animated WebP and the only frame of a still.
+        f"[1:v]scale={out_w}:{out_h}:flags=lanczos[fg];"
+        # `format=rgb` composites in RGB — blending straight onto the YUV
+        # canvas tints the semi-transparent edge pixels of a cut-out.
+        f"[0:v][fg]overlay=shortest=1:format=rgb,format=rgb24",
+        "-frames:v", "1",
+        str(dst),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        dst.unlink(missing_ok=True)
+        raise VideoGenerationError(
+            "Couldn't read that image: "
+            f"{(result.stderr or '').strip()[-200:] or 'ffmpeg failed'}"
+        )
+    return out_w, out_h
+
+
+async def normalize_still(src: Path, dst: Path) -> tuple[int, int]:
+    """Async wrapper for _normalize_still_sync. See its docstring."""
+    return await asyncio.to_thread(_normalize_still_sync, src, dst)
+
+
+# ── Ken Burns motion grammar ───────────────────────────────────────────────
+
+_KENBURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up"]
+
+
+def _kenburns_image_vf(effect: str, frames: int, out_w: int, out_h: int, fps: int) -> str:
+    """Build the FFmpeg -vf chain that turns a still image into a Ken Burns
+    clip of exactly (out_w x out_h).
+
+    ONE motion grammar, ONE place to fix it — shared by every still-to-video
+    path so a fix here cannot reach one of them and miss the other.
+
+    Two bugs this builder is the fix for:
+
+    1. DISTORTION. The old chain scaled with `scale=8000:-1` (preserving the
+       SOURCE aspect) and then leaned on zoompan's `s=WxH`. But zoompan's crop
+       window keeps the INPUT aspect and `s=` anamorphically STRETCHES it to
+       the output size, so any image whose aspect differs from the target
+       (a square photo into a 9:16 video, a phone panorama into 16:9) came out
+       visibly squeezed or elongated. Fix: cover-crop to the target aspect
+       FIRST, at 2x target resolution for subpixel-smooth motion. zoompan's
+       window then has the same aspect as `s=` and the scale is distortion-free.
+
+    2. FROZEN PANS. The pan expressions used `(iw/1.3 - out_w)` as the travel
+       range — mixing input-space pixels (iw) with output-space pixels (out_w).
+       That range overshoots zoompan's own clamp of `iw - iw/zoom`, so a "pan"
+       sat pinned against one edge for the first half of its duration and then
+       lurched across. The correct travel range is `(iw - iw/zoom)`.
+
+    2x target is also plenty of headroom for smooth zoompan; the old 8000px
+    wide scale decoded and held a huge intermediate frame for no visible gain.
+    """
+    if effect == "zoom_in":
+        zp = f"z='1+0.5*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+    elif effect == "zoom_out":
+        zp = f"z='1.5-0.5*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+    elif effect == "pan_left":
+        zp = f"z='1.3':x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)'"
+    elif effect == "pan_right":
+        zp = f"z='1.3':x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)'"
+    else:  # pan_up
+        zp = f"z='1.3':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-on/{frames})'"
+
+    pre_w, pre_h = out_w * 2, out_h * 2
+    return (
+        f"{cover_vf(pre_w, pre_h, setsar=False)},"
+        f"zoompan={zp}:d={frames}:s={out_w}x{out_h}:fps={fps},"
+        f"format=yuv420p"
+    )
 
 
 async def generate_kenburns_video(
@@ -534,35 +736,36 @@ async def generate_kenburns_video(
         per_image = max(total_duration // len(image_paths), 3)
         frames_per_image = per_image * fps
 
-        effects = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up"]
         tmp_clips = []
+        # Normalized copies of the source stills — scratch, deleted alongside
+        # the clips below.
+        tmp_stills: list[Path] = []
 
         for idx, img_path in enumerate(image_paths):
-            effect = random.choice(effects)
+            effect = random.choice(_KENBURNS_EFFECTS)
             clip_path = _tmp(f"kb_clip_{idx:03d}.mp4")
 
-            # zoompan filter expressions (d = total frames for this image)
-            d = frames_per_image
-            if effect == "zoom_in":
-                zp = f"z='1+0.5*on/{d}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-            elif effect == "zoom_out":
-                zp = f"z='1.5-0.5*on/{d}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-            elif effect == "pan_left":
-                zp = f"z='1.3':x='(iw/1.3-{out_w})*(1-on/{d})':y='ih/2-(ih/zoom/2)'"
-            elif effect == "pan_right":
-                zp = f"z='1.3':x='(iw/1.3-{out_w})*on/{d}':y='ih/2-(ih/zoom/2)'"
-            else:  # pan_up
-                zp = f"z='1.3':x='iw/2-(iw/zoom/2)':y='(ih/1.3-{out_h})*(1-on/{d})'"
+            # Normalize FIRST — the chain below ends on `format=yuv420p`,
+            # which discards alpha instead of compositing it, so a
+            # background-removed cut-out would render as a garbage-fringed
+            # subject with no error. Normalizing here rather than at the
+            # caller means no still-image entry point can forget to.
+            try:
+                norm_path = _tmp(f"kb_norm_{idx:03d}.png")
+                _normalize_still_sync(img_path, norm_path)
+                tmp_stills.append(norm_path)
+                img_path = norm_path
+            except Exception as e:
+                logger.warning(
+                    f"Ken Burns still {idx} could not be normalized "
+                    f"({img_path}): {e} — using it as-is"
+                )
 
-            # Scale source image to high res for zoompan, then apply effect
             cmd = [
                 "ffmpeg", "-y",
                 "-i", str(img_path),
-                "-vf", (
-                    f"scale=8000:-1,"
-                    f"zoompan={zp}:d={d}:s={out_w}x{out_h}:fps={fps},"
-                    f"format=yuv420p"
-                ),
+                "-vf", _kenburns_image_vf(
+                    effect, frames_per_image, out_w, out_h, fps),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                 "-t", str(per_image),
                 str(clip_path),
@@ -571,7 +774,7 @@ async def generate_kenburns_video(
             if result.returncode == 0 and clip_path.exists():
                 tmp_clips.append(clip_path)
             else:
-                logger.warning(f"Ken Burns clip {idx} failed: {result.stderr[:300]}")
+                logger.warning(f"Ken Burns clip {idx} failed: {ffmpeg_error(result.stderr, 300)}")
 
         if not tmp_clips:
             raise VideoGenerationError("All Ken Burns clips failed to generate")
@@ -618,7 +821,7 @@ async def generate_kenburns_video(
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 # Fallback: simple concat without crossfade
-                logger.warning(f"xfade stitch failed, falling back to concat: {result.stderr[:300]}")
+                logger.warning(f"xfade stitch failed, falling back to concat: {ffmpeg_error(result.stderr, 300)}")
                 concat_file = _tmp("kb_concat.txt")
                 with open(concat_file, "w") as f:
                     for clip in tmp_clips:
@@ -633,7 +836,7 @@ async def generate_kenburns_video(
                 ]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 if result.returncode != 0:
-                    raise VideoGenerationError(f"Ken Burns stitch failed: {result.stderr[:300]}")
+                    raise VideoGenerationError(f"Ken Burns stitch failed: {ffmpeg_error(result.stderr, 300)}")
                 concat_file.unlink(missing_ok=True)
 
         # Merge audio if provided
@@ -649,7 +852,7 @@ async def generate_kenburns_video(
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode == 0:
                 # Clean up temp clips
-                for clip in tmp_clips:
+                for clip in tmp_clips + tmp_stills:
                     clip.unlink(missing_ok=True)
                 if final_video != output_path:
                     final_video.unlink(missing_ok=True)
@@ -658,11 +861,68 @@ async def generate_kenburns_video(
         # No audio or merge failed — move video to output
         import shutil
         shutil.move(str(final_video), str(output_path))
-        for clip in tmp_clips:
+        for clip in tmp_clips + tmp_stills:
             clip.unlink(missing_ok=True)
         return output_path
 
     return await asyncio.to_thread(_generate)
+
+
+async def generate_single_kenburns_clip(
+    image_path: Path,
+    duration: float,
+    output_path: Path,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    fps: int = 30,
+    normalize: bool = True,
+) -> Path:
+    """Turn ONE still into ONE silent clip of exactly `duration` seconds at
+    target_w x target_h, with a Ken Burns move.
+
+    The per-scene counterpart to generate_kenburns_video, which owns a whole
+    video: this one produces a clip that stitches alongside stock footage, so
+    it must land on the same geometry and carry no audio track.
+
+    `normalize=False` is for callers that already ran normalize_still() —
+    typically because they needed to know whether the image was READABLE
+    before committing to a plan around it, and re-running the pass would be
+    pure duplicated work. Everyone else should leave it on; see
+    normalize_still's docstring for what goes wrong without it.
+    """
+    image_path, output_path = Path(image_path), Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    scratch: Path | None = None
+    if normalize:
+        scratch = _tmp(f"kb_one_{uuid4().hex[:6]}.png")
+        await normalize_still(image_path, scratch)
+        image_path = scratch
+
+    def _generate():
+        frames = max(1, int(duration * fps))
+        effect = random.choice(_KENBURNS_EFFECTS)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(image_path),
+            "-vf", _kenburns_image_vf(effect, frames, target_w, target_h, fps),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-t", str(duration),
+            "-an",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0 or not output_path.exists():
+            raise VideoGenerationError(
+                f"Ken Burns clip failed: {ffmpeg_error(result.stderr, 300)}"
+            )
+        return output_path
+
+    try:
+        return await asyncio.to_thread(_generate)
+    finally:
+        if scratch is not None:
+            scratch.unlink(missing_ok=True)
 
 
 async def apply_auto_zoom(
@@ -708,8 +968,7 @@ async def apply_auto_zoom(
         try:
             probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
         except subprocess.TimeoutExpired:
-            logger.warning("ffprobe timed out for auto-zoom, returning original")
-            return video_path
+            raise VideoGenerationError("ffprobe timed out while preparing auto-zoom")
         try:
             parts = probe.stdout.strip().split(",")
             vid_w, vid_h = int(parts[0]), int(parts[1])
@@ -788,18 +1047,7 @@ async def apply_auto_zoom(
             return video_path
 
         zoom_expr = "1+" + "+".join(zoom_parts)
-
-        # Crop dimensions: crop to (w/z, h/z) centered, then scale back to original
-        # crop=w/z:h/z:(w-w/z)/2:(h-h/z)/2, scale=w:h
-        crop_w = f"{vid_w}/({zoom_expr})"
-        crop_h = f"{vid_h}/({zoom_expr})"
-        crop_x = f"({vid_w}-{crop_w})/2"
-        crop_y = f"({vid_h}-{crop_h})/2"
-
-        vf = (
-            f"crop=w={crop_w}:h={crop_h}:x={crop_x}:y={crop_y},"
-            f"scale={vid_w}:{vid_h}:flags=lanczos"
-        )
+        vf = auto_zoom_vf(vid_w, vid_h, zoom_expr)
 
         cmd = [
             "ffmpeg", "-y",
@@ -812,14 +1060,92 @@ async def apply_auto_zoom(
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired:
-            logger.warning("Auto-zoom FFmpeg timed out after 600s, returning original")
-            return video_path
+            raise VideoGenerationError("Auto-zoom FFmpeg timed out after 600s")
         if result.returncode != 0:
-            logger.warning(f"Auto-zoom failed, returning original: {result.stderr[:400]}")
-            return video_path
+            # RAISE rather than hand back the input: every caller treated the
+            # returned path as a finished result, so while the filtergraph
+            # below could not parse at all, every auto-zoom "succeeded" with a
+            # byte-identical copy of the source.
+            raise VideoGenerationError(f"Auto-zoom FFmpeg failed: {ffmpeg_error(result.stderr)}")
         return output_path
 
     return await asyncio.to_thread(_run)
+
+
+def auto_zoom_vf(vid_w: int, vid_h: int, zoom_expr: str) -> str:
+    """The auto-zoom filtergraph, as a pure function so a test can pin it.
+
+    Two things the previous form got wrong, each fatal on its own:
+
+    1. `zoom_expr` contains `between(t,a,b)`, whose COMMAS are filtergraph
+       separators unless the option value is quoted. ffmpeg split the graph
+       mid-expression and failed with "No option name near
+       '.../(1+0.15*sin(PI*(t-0.000)/1.000)*between(t'" on every single input.
+    2. It animated `crop`'s w/h, and ffmpeg evaluates those ONCE at filter
+       init, where `t` is NaN — a time-varying crop SIZE can never work.
+
+    `scale` with `eval=frame` re-evaluates its size per frame (where `t` is
+    defined), and a fixed centred `crop` at the source size brings the frame
+    back to its original dimensions. `trunc(.../2)*2` keeps both sides even at
+    every zoom level, which yuv420p requires.
+    """
+    z = f"({zoom_expr})"
+    return (
+        f"scale=w='trunc({vid_w}*{z}/2)*2':h='trunc({vid_h}*{z}/2)*2':eval=frame,"
+        f"crop={vid_w}:{vid_h}"
+    )
+
+
+ASPECT_DIMS = {
+    "16:9": (1920, 1080),
+    "9:16": (1080, 1920),
+    "1:1":  (1080, 1080),
+    "4:5":  (1080, 1350),
+}
+
+
+async def _probe_dimensions(video_path: Path) -> tuple[int, int]:
+    """(width, height) of the first video stream, or (0, 0) if unreadable —
+    callers treat 0 as 'unknown' and fall back to the safe path."""
+    def _run() -> tuple[int, int]:
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0", str(video_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            w, h = probe.stdout.strip().split(",")[:2]
+            return int(w), int(h)
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            logger.debug("Could not probe video dimensions: %s", e)
+            return 0, 0
+    return await asyncio.to_thread(_run)
+
+
+def pick_reframe_method(src_w: int, src_h: int, target_aspect: str) -> str:
+    """Choose crop vs blur_fill for a re-frame. Pure — unit-tested.
+
+    blur_fill is the right look when NARROWING (16:9 -> 9:16): the whole frame
+    is preserved as a centered band over a blurred backdrop, which is the
+    familiar short-form treatment.
+
+    WIDENING it is actively bad: fitting a 9:16 source inside 16:9 leaves the
+    real content as a narrow full-height strip, ~1/3 of the width, with blur
+    either side. When the source is ITSELF a blur_fill composite — which every
+    ViralMint short is, since that's how shorts are built from landscape
+    sources — the result nests a second box and the picture lands at roughly a
+    third of the frame in each direction. Cropping to fill keeps the pixels
+    sharp and full-frame; on an already-composited source it lands almost
+    exactly on the original content band. The cost is the top/bottom margin —
+    on a true portrait source that can clip a burned caption, which still beats
+    rendering it at a third scale.
+    """
+    tw, th = ASPECT_DIMS.get(target_aspect, (1920, 1080))
+    if not src_w or not src_h:
+        return "blur_fill"          # unknown source → the safe, lossless look
+    # 2% tolerance so a near-identical aspect (1.77 vs 1.78) isn't "widening".
+    return "crop" if (tw / th) > (src_w / src_h) * 1.02 else "blur_fill"
 
 
 async def convert_aspect_ratio(
@@ -833,27 +1159,35 @@ async def convert_aspect_ratio(
 
     target_aspect: "16:9" or "9:16"
     method:
+      - "auto": crop when widening, blur_fill when narrowing (see
+        `pick_reframe_method`) — what callers should use unless the user
+        explicitly picked a look
       - "letterbox": add black bars to fill (no content lost)
       - "crop": crop center to fill (content lost at edges)
       - "blur_fill": blurred+scaled background behind original (modern look)
 
     Returns path to converted video.
     """
+    if method == "auto":
+        src_w, src_h = await _probe_dimensions(video_path)
+        method = pick_reframe_method(src_w, src_h, target_aspect)
+        logger.info("convert_aspect_ratio: auto → %s (src %sx%s → %s)",
+                    method, src_w, src_h, target_aspect)
+
     if output_path is None:
         stem = video_path.stem
         output_path = video_path.parent / f"{stem}_{target_aspect.replace(':', 'x')}_{method}.mp4"
 
+    # This cache check is only safe because the encode below lands via
+    # temp-then-replace. A timed-out or killed pass used to leave a PARTIAL file
+    # at exactly this name, and every later call returned it instantly — for the
+    # export bundle that meant a truncated mp4 persisted as the landscape
+    # version and was served from then on.
     if output_path.exists():
         return output_path
 
     def _run():
-        ASPECT_MAP = {
-            "16:9": (1920, 1080),
-            "9:16": (1080, 1920),
-            "1:1":  (1080, 1080),
-            "4:5":  (1080, 1350),
-        }
-        target_w, target_h = ASPECT_MAP.get(target_aspect, (1920, 1080))
+        target_w, target_h = ASPECT_DIMS.get(target_aspect, (1920, 1080))
 
         if method == "letterbox":
             # Pad with black bars — no content lost
@@ -883,18 +1217,63 @@ async def convert_aspect_ratio(
             )
 
         filter_flag = "-filter_complex" if method == "blur_fill" else "-vf"
-        cmd = [
+        common = [
             "ffmpeg", "-y", "-i", str(video_path),
             filter_flag, vf,
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "128k",
-            str(output_path),
+            # yuv420p like every other re-encode in this module. Without it a
+            # 10-bit source exported a file Safari and iOS refuse to play.
+            "-pix_fmt", "yuv420p",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            logger.error(f"Aspect ratio conversion failed: {result.stderr[:500]}")
-            raise VideoGenerationError(f"FFmpeg aspect conversion failed: {result.stderr[:200]}")
-        return output_path
+        # Encode to a unique temp beside the target, then rename atomically —
+        # the same discipline extract_thumbnail and extract_frame_at use. Two
+        # callers can race the same derived output name, and a partial file at
+        # that name is permanent (see the cache check above).
+        tmp_path = output_path.with_name(
+            f"{output_path.stem}.{uuid4().hex[:8]}.part{output_path.suffix}"
+        )
+        # Scaled to the SOURCE length for the same reason extract_clip is: this
+        # is a full re-encode, and 300s was a constant sized for short clips, so
+        # a 12-minute export hit the wall and left its partial behind.
+        budget = _clip_timeout_for_duration(probe_duration(video_path, 0.0))
+        # Audio is untouched by an aspect conversion — copy it instead of
+        # paying a 128k AAC generation every pass. Chained tools stack these:
+        # reframe → captions → watermark used to re-encode the same voice
+        # track three times for three geometry operations. The copy is
+        # invalid for codecs mp4 can't carry (Opus/Vorbis out of a WebM/MKV
+        # source), so the re-encode stays as the second rung.
+        last_err = ""
+        for label, aargs in (("copy", ["-c:a", "copy"]),
+                             ("re-encode", ["-c:a", "aac", "-b:a", "128k"])):
+            try:
+                result = subprocess.run(common + aargs + [str(tmp_path)],
+                                        capture_output=True, text=True, timeout=budget)
+            except BaseException:
+                # Including a timeout, which used to escape this function
+                # leaving the partial file at the CACHED name.
+                tmp_path.unlink(missing_ok=True)
+                raise
+            if result.returncode == 0:
+                # Exit 0 is not proof of an artifact — the sibling cutters in
+                # this module all size-check before handing a path back.
+                size = tmp_path.stat().st_size if tmp_path.exists() else 0
+                if size < 1000:
+                    tmp_path.unlink(missing_ok=True)
+                    raise VideoGenerationError(
+                        f"FFmpeg aspect conversion exited 0 but produced {size} bytes"
+                    )
+                tmp_path.replace(output_path)
+                return output_path
+            last_err = result.stderr[-500:]
+            logger.warning("Aspect conversion (%s audio) failed: %s", label, last_err[:200])
+            # A failed pass leaves a partial temp behind; drop it so the next
+            # attempt isn't fooled by it and a failure can't look like a result.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        logger.error(f"Aspect ratio conversion failed: {last_err}")
+        raise VideoGenerationError(f"FFmpeg aspect conversion failed: {last_err[:200]}")
 
     return await asyncio.to_thread(_run)
 
@@ -906,3 +1285,313 @@ def _format_srt_time(seconds: float) -> str:
     s = int(seconds % 60)
     ms = int((seconds % 1) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def has_audio_stream_sync(media_path: Path) -> bool:
+    """Blocking core of `has_audio_stream`, for callers already on a thread.
+
+    One implementation, two entry points — a second ffprobe-for-audio helper
+    is exactly how two call sites end up disagreeing about what "has audio"
+    means on a probe failure.
+    """
+    media_path = Path(media_path)
+    if not media_path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet",
+             "-select_streams", "a",
+             "-show_entries", "stream=index",
+             "-of", "csv=p=0",
+             str(media_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # On probe failure, default to "yes" so we don't block transcription
+        # for files that might still work — whisper's own error path is
+        # the safety net.
+        return True
+
+
+async def has_audio_stream(media_path: Path) -> bool:
+    """Quick ffprobe check: does this file contain any audio stream?
+
+    Used by whisper_service to fail fast with a clear error when handed
+    a video-only file (e.g. a download that missed the audio track) —
+    faster-whisper's own error in that case is an opaque "tuple index
+    out of range" from deep inside its decoder.
+    """
+    return await asyncio.to_thread(has_audio_stream_sync, media_path)
+
+
+async def extract_frame_at(
+    video_path: Path,
+    timestamp: float,
+    output_path: Path,
+    quality: int = 2,
+    scale_width: int | None = None,
+) -> Path | None:
+    """Extract a single frame at an exact timestamp.
+
+    Generalised counterpart to `extract_thumbnail` — the caller owns the
+    output path, so it can write into a cache keyed however it likes instead
+    of bouncing through the thumbnails directory under a derived name.
+
+    Args:
+        video_path: Source file. Must exist on disk.
+        timestamp: Seconds into the video. Out-of-range values are clamped by
+            ffmpeg's own seek; the extracted frame is the closest one
+            at-or-before.
+        output_path: Where to write the JPEG. Parent dir is created.
+        quality: -q:v value (1=best, 31=worst). 2 matches extract_thumbnail.
+        scale_width: optional output width in px, aspect preserved. Callers
+            that only ever display a small frame (the Clipper bench's
+            132px-wide IN/OUT panes) should pass it — encoding a full 1080p
+            JPEG per drag settle is bytes and CPU nobody sees.
+
+    Returns:
+        The output path on success, None on failure (logged). An empty file
+        counts as a failure: a 0-byte JPEG renders as a broken image, which
+        is worse than no image at all.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _extract():
+        # Write to a unique temp sibling, then os.replace: this file is a
+        # cache entry served with immutable headers, and building it in
+        # place let a concurrent request stat a half-written JPEG and pin
+        # the truncated bytes in the browser for a year.
+        import uuid
+        tmp = output_path.with_name(
+            f"{output_path.stem}.{uuid.uuid4().hex[:8]}.tmp{output_path.suffix}")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(max(0.0, float(timestamp))),  # -ss BEFORE -i = fast seek
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-q:v", str(quality),
+        ]
+        if scale_width:
+            # -2 keeps the height even and the aspect intact.
+            cmd += ["-vf", f"scale={int(scale_width)}:-2"]
+        cmd.append(str(tmp))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                logger.warning(
+                    "Frame extract failed at t=%.2fs for %s: %s",
+                    timestamp, video_path.name, ffmpeg_error(result.stderr, 200),
+                )
+                return None
+            if not tmp.exists() or tmp.stat().st_size == 0:
+                logger.warning("Frame extract produced empty file at t=%.2fs", timestamp)
+                return None
+            tmp.replace(output_path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return output_path
+
+    return await asyncio.to_thread(_extract)
+
+
+# Filmstrip sampling bounds — see extract_filmstrip.
+MIN_CELL_SEC = 0.2       # densest useful sampling; also caps the ffmpeg spawns
+TAIL_MARGIN_SEC = 0.25   # keep the last seek inside the last decodable frame
+
+
+async def extract_filmstrip(
+    video_path: Path,
+    output_path: Path,
+    count: int = 32,
+    tile_height: int = 64,
+    duration: float | None = None,
+    concurrency: int = 6,
+) -> Path | None:
+    """Render a horizontal contact sheet: `count` frames tiled 1 row deep.
+
+    This is the scrubbing background behind Clipper's cutting bench — one
+    image request instead of `count` of them, so a wide timeline paints in a
+    single paint.
+
+    Why per-frame fast seek and not `-vf fps=…`: an fps filter decodes the
+    ENTIRE source (minutes on a one-hour podcast, which is exactly the input
+    Clipper exists for), and its frame count drifts with rounding — a short
+    tile flushes padded with black. Seeking to each timestamp with `-ss`
+    before `-i` is O(1) per frame and lands on exact times, so cell i
+    genuinely means `duration * (i + 0.5) / count`. The tiling pass then
+    reads an image sequence, where the input count is known exactly and the
+    tile is always complete.
+
+    Args:
+        video_path: Source file. Must exist.
+        output_path: Where the JPEG strip lands. Parent dir is created.
+        count: Number of cells (clamped 4..96).
+        tile_height: Cell height in px (clamped 24..160). Width follows the
+            source aspect, rounded even for the encoder.
+        duration: Source duration if the caller already knows it; probed when
+            omitted.
+        concurrency: Parallel ffmpeg seeks. 6 keeps a long source fast
+            without saturating a laptop's cores.
+
+    Returns:
+        `output_path` on success, None on failure (logged). A partial
+        extraction is a failure: a strip with holes would mislead the user
+        about where they are in the video.
+    """
+    if not video_path.exists():
+        return None
+
+    count = max(4, min(int(count), 96))
+    tile_height = max(24, min(int(tile_height), 160))
+
+    if duration is None or duration <= 0:
+        duration = await asyncio.to_thread(probe_duration, video_path, 0.0)
+    if not duration or duration <= 0:
+        logger.warning("filmstrip: could not probe duration for %s", video_path.name)
+        return None
+
+    # Never sample denser than MIN_CELL_SEC. A wide timeline over a 9-second
+    # TikTok would otherwise ask for cells 60ms apart — dozens of ffmpeg
+    # spawns for frames that repeat, and (before the tail clamp below) a
+    # guaranteed failure on the last one.
+    count = min(count, max(4, int(duration / MIN_CELL_SEC)))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    work = settings.TMP_DIR / f"strip_{uuid4().hex[:12]}"
+    work.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Cell centres, so the first frame (often a black fade-in) isn't the
+        # one that represents the opening.
+        #
+        # The tail clamp is load-bearing. A container's reported duration runs
+        # to the END of the last frame, so the final cell's centre —
+        # duration × (count-0.5)/count — can sit past the last frame's
+        # presentation time, and `-ss` there decodes nothing. One missing
+        # frame fails the whole strip, so a 6s source asked for 32 cells
+        # produced no timeline at all. Clamping the SEEK (not the cell's
+        # nominal time) keeps every cell's position on the timeline honest and
+        # costs at most a slightly-early final thumbnail.
+        seek_ceiling = max(0.0, duration - TAIL_MARGIN_SEC)
+        stamps = [min(duration * (i + 0.5) / count, seek_ceiling) for i in range(count)]
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def _one(i: int, ts: float):
+            out = work / f"f{i + 1:03d}.jpg"
+            async with sem:
+                got = await extract_frame_at(
+                    video_path=video_path, timestamp=ts, output_path=out,
+                    quality=6,  # strip cells are ~100px wide; q6 halves the bytes
+                )
+                if got:
+                    return got
+                # A fixed ceiling can't know the source's frame interval — a
+                # 1fps video's last frame is a whole second before the end.
+                # Step back once rather than losing the strip.
+                retry = max(0.0, ts - max(1.0, duration * 0.02))
+                if retry >= ts:
+                    return None
+                return await extract_frame_at(
+                    video_path=video_path, timestamp=retry, output_path=out, quality=6,
+                )
+
+        # Probe the two ENDS before committing to the middle. A strip needs
+        # every cell (see the docstring — one with holes would mislead the user
+        # about where they are), so if either end fails the strip fails anyway
+        # and the other 30 spawns buy nothing. Without this, an unreadable
+        # source costs 2N ffmpeg spawns — every cell fails and every failure
+        # retries once — plus N log lines, and pays it again every time that
+        # source is selected, because the bench rebuilds the strip each visit.
+        #
+        # BOTH ends are probed, not just the first, because the two realistic
+        # damage shapes differ. A download cancelled mid-write leaves a valid
+        # header, a plausible duration and no usable data at all — that fails
+        # cell 0. A download truncated at the END still decodes its opening
+        # frames and fails everything after: measured on a 45s source cut to
+        # 7% of its bytes, cell 0 succeeded and 31 cells then failed for 61
+        # ffmpeg spawns. Probing the tail catches that one for two.
+        #
+        # Bailing on the tail is outcome-identical to running the full set:
+        # `_one` already retries a step-back for low-frame-rate sources, so a
+        # tail that fails here would have failed the `len(ok) < count` check
+        # below regardless.
+        last_i = len(stamps) - 1
+        first = await _one(0, stamps[0])
+        if not first:
+            logger.warning(
+                "filmstrip: %s decodes no frames — skipping the remaining %d "
+                "cells (corrupt or partially-downloaded source?)",
+                video_path.name, last_i,
+            )
+            return None
+
+        last = await _one(last_i, stamps[last_i]) if last_i else first
+        if not last:
+            logger.warning(
+                "filmstrip: %s decodes its opening frames but not its end — "
+                "skipping the remaining %d cells (truncated download?)",
+                video_path.name, max(0, last_i - 1),
+            )
+            return None
+
+        middle = await asyncio.gather(
+            *(_one(i, ts) for i, ts in enumerate(stamps) if 0 < i < last_i),
+            return_exceptions=True,
+        )
+        results = [first, last, *middle] if last_i else [first]
+        ok = [r for r in results if r and not isinstance(r, Exception)]
+        if len(ok) < count:
+            logger.warning(
+                "filmstrip: only %d/%d frames extracted from %s — no strip",
+                len(ok), count, video_path.name,
+            )
+            return None
+
+        def _tile():
+            # Temp-then-replace, same reason as extract_frame_at: the strip
+            # is served immutable, so a half-written tile must never be
+            # observable at the final path.
+            import uuid
+            tmp = output_path.with_name(
+                f"{output_path.stem}.{uuid.uuid4().hex[:8]}.tmp{output_path.suffix}")
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "image2",
+                "-start_number", "1",
+                "-i", str(work / "f%03d.jpg"),
+                # scale=-2 keeps the width even (some JPEG encoders reject odd
+                # chroma widths) and preserves aspect, so a cell is never
+                # squashed.
+                "-vf", f"scale=-2:{tile_height},tile={count}x1",
+                "-frames:v", "1",
+                "-q:v", "5",
+                str(tmp),
+            ]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    logger.warning("filmstrip tile failed for %s: %s",
+                                   video_path.name, r.stderr[-300:])
+                    return None
+                if not tmp.exists() or tmp.stat().st_size == 0:
+                    logger.warning("filmstrip tile produced an empty file for %s",
+                                   video_path.name)
+                    return None
+                tmp.replace(output_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return output_path
+
+        return await asyncio.to_thread(_tile)
+    finally:
+        # Clean up our own scratch explicitly — TMP_DIR holds yt-dlp's cookie
+        # jar and uploaded media, so it has no blanket purge to fall back on.
+        def _cleanup():
+            for p in work.glob("*"):
+                p.unlink(missing_ok=True)
+            work.rmdir()
+        try:
+            await asyncio.to_thread(_cleanup)
+        except OSError:
+            pass

@@ -11,6 +11,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.downloaded_video import DownloadedVideo
 from backend.models.user_settings import UserSettings
 from backend.core.ai_provider import get_ai_client
+from backend.core.prompt_rules import OUTPUT_LANGUAGE_RULE, extract_json_text
 from backend.core.ws_manager import ws_manager
 from backend.agents.job_helper import update_job_status
 
@@ -19,7 +20,8 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_CORRECTION_PROMPT = """Fix transcription errors in the following speech-to-text output.
 Correct spelling, grammar, punctuation, and proper nouns based on context.
 Do NOT change the meaning or rephrase sentences — only fix obvious transcription mistakes.
-Return the corrected text only, no explanation.
+Keep the transcript's own language. Return the corrected text only — no preamble
+("Here is…"), no explanation, no quotes around it.
 
 Raw transcript:
 {transcript}"""
@@ -52,7 +54,8 @@ Return JSON only (no markdown):
     "composite": 7.1
   }},
   "structural_pattern": "hook-problem-solution or listicle or story-arc or tutorial or reaction",
-  "retention_risks": ["timestamp or moment where viewers likely drop off and why"]
+  "retention_risks": ["the moment (quote the line) where viewers likely drop off and why — no invented timestamps"],
+  "recreate_prompt": "A single ready-to-run generation brief that recreates this video's WINNING SHAPE for a new topic: name the hook archetype, beat order, pacing, tone, and visual treatment as directives (e.g. 'Open on a bold contrarian claim in the first sentence; 3 rapid proof beats of ~8s each; conversational expert tone; end with a question CTA'). Format + structure only — never reuse this video's wording or topic."
 }}
 
 IMPORTANT for the "scores" object:
@@ -65,6 +68,7 @@ IMPORTANT for the "scores" object:
 - uniqueness: Is the angle original or just copying others?
 - actionability: Does the viewer learn something usable?
 - composite: weighted average (hook 20%, structure 15%, emotional 15%, trend 15%, production 10%, uniqueness 15%, actionability 10%)"""
+INSIGHTS_PROMPT += "\n\n" + OUTPUT_LANGUAGE_RULE  # state the language — Claude does not infer it (prompt_rules)
 
 
 SEGMENT_ANALYSIS_PROMPT = """Analyze this video transcript segment-by-segment for retention and virality.
@@ -106,6 +110,7 @@ SCORING GUIDE:
 
 Use start_pct and end_pct as percentage of total transcript length (0-100).
 Be honest — most segments should score 4-7, not 8-10."""
+SEGMENT_ANALYSIS_PROMPT += "\n\n" + OUTPUT_LANGUAGE_RULE  # state the language — Claude does not infer it (prompt_rules)
 
 
 IMPROVEMENT_PROMPT = """You are a viral video strategist. Based on the analysis below, provide
@@ -123,7 +128,7 @@ Provide 5 concrete improvements as JSON only (no markdown):
     {{
       "category": "hook",
       "priority": "high",
-      "original_approach": "What the original video did (be specific with timestamps/quotes)",
+      "original_approach": "What the original video did (be specific — quote its lines; the transcript has no timestamps, so never invent them)",
       "improvement": "Exact change to make — e.g. 'Open with the result first: show the $10K savings chart in frame 1, THEN explain how'",
       "expected_impact": "Why this works better — reference platform algorithm or viewer psychology"
     }},
@@ -166,6 +171,91 @@ RULES:
 - Be SPECIFIC — reference actual content from the transcript, not generic advice
 - "improvement" must be a concrete action, not a vague suggestion
 - Each improvement should be different from the others"""
+IMPROVEMENT_PROMPT += "\n\n" + OUTPUT_LANGUAGE_RULE  # state the language — Claude does not infer it (prompt_rules)
+
+
+# --- Transcript correction ---------------------------------------------------
+# The AI correction pass is best-effort polish: the transcript must NEVER lose
+# content because of it. Long transcripts are corrected in sentence-aligned
+# chunks (concurrently); a chunk whose correction fails or looks suspicious
+# keeps its raw text. Chunks past MAX_CORRECTION_CHUNKS pass through raw to
+# bound AI cost/latency on very long videos.
+CORRECTION_CHUNK_CHARS = 2500  # stays under max_tokens=4096 even for CJK (~1 token/char)
+MAX_CORRECTION_CHUNKS = 6      # ~15k chars ≈ an hour of dense speech
+_CORRECTION_CONCURRENCY = 3
+_SENTENCE_ENDS = "。！？…!?.\n"
+
+
+def _split_for_correction(text: str, chunk_chars: int = CORRECTION_CHUNK_CHARS) -> list[str]:
+    """Split text into <=chunk_chars pieces, cutting at sentence ends when possible."""
+    chunks = []
+    i, n = 0, len(text)
+    while i < n:
+        end = min(i + chunk_chars, n)
+        if end < n:
+            window = text[i:end]
+            cut = max(window.rfind(c) for c in _SENTENCE_ENDS)
+            if cut > chunk_chars // 2:
+                end = i + cut + 1
+        chunks.append(text[i:end])
+        i = end
+    return chunks
+
+
+async def _ai_correct_transcript(user_settings, raw_text: str) -> str:
+    """Best-effort AI cleanup of a Whisper transcript. AI failures never raise
+    and never lose content — worst case is the raw text back."""
+    chunks = _split_for_correction(raw_text)
+    to_correct = chunks[:MAX_CORRECTION_CHUNKS]
+    passthrough = chunks[MAX_CORRECTION_CHUNKS:]
+    if passthrough:
+        logger.info(
+            "Transcript correction: correcting %d/%d chunks (%d chars pass through raw)",
+            len(to_correct), len(chunks), sum(len(c) for c in passthrough),
+        )
+
+    try:
+        ai = get_ai_client(user_settings)
+    except Exception as e:
+        logger.warning(f"AI transcript correction unavailable: {e} — using raw Whisper output")
+        return raw_text
+    sem = asyncio.Semaphore(_CORRECTION_CONCURRENCY)
+
+    async def _correct_one(chunk: str) -> str:
+        async with sem:
+            corrected = await ai.chat(
+                messages=[{"role": "user", "content": TRANSCRIPT_CORRECTION_PROMPT.format(
+                    transcript=chunk.strip()
+                )}],
+                max_tokens=4096,
+            )
+        corrected = (corrected or "").strip()
+        # A "Here is the corrected transcript:" preamble passes the length
+        # guard and would be stored in the transcript — drop one opening line
+        # that ends in a colon.
+        first, _, rest = corrected.partition("\n")
+        if rest and first.rstrip().endswith((":", "：")) and len(first) < 80:
+            corrected = rest.strip()
+        if corrected and 0.5 * len(chunk) <= len(corrected) <= 2 * len(chunk) + 50:
+            return corrected
+        logger.warning(
+            "Transcript correction chunk looked suspicious (%d -> %d chars) — keeping raw",
+            len(chunk), len(corrected),
+        )
+        return chunk.strip()
+
+    results = await asyncio.gather(
+        *(_correct_one(c) for c in to_correct), return_exceptions=True
+    )
+    out = []
+    for chunk, res in zip(to_correct, results):
+        if isinstance(res, BaseException):
+            logger.warning(f"Transcript correction chunk failed: {res} — keeping raw")
+            out.append(chunk.strip())
+        else:
+            out.append(res)
+    out.extend(c.strip() for c in passthrough)
+    return "\n\n".join(p for p in out if p)
 
 
 class AnalyzerAgent:
@@ -233,30 +323,23 @@ class AnalyzerAgent:
                         logger.warning(f"No audio/video file for {dv.id} — skipping transcription")
                         continue
 
-                    from backend.services.whisper_service import whisper_service
-                    await asyncio.to_thread(whisper_service.load, whisper_quality)
-                    transcript_data = await whisper_service.transcribe(audio_path)
+                    from backend.services.whisper_service import (
+                        whisper_service, job_download_notice)
+                    # No pre-load: `transcribe()` goes through ensure_model(),
+                    # which loads off the loop AND announces a first-run
+                    # download. A bare `load()` here did neither.
+                    transcript_data = await whisper_service.transcribe(
+                        audio_path, quality=whisper_quality,
+                        on_download=job_download_notice(job_id, user_id))
                     transcript_source = "whisper"
 
-                    # AI post-correction of Whisper transcript
+                    # AI post-correction of Whisper transcript (chunked; never loses content)
                     raw_text = transcript_data.get("text", "")
                     if raw_text:
-                        try:
-                            ai = get_ai_client(user_settings)
-                            corrected = await ai.chat(
-                                messages=[{"role": "user", "content": TRANSCRIPT_CORRECTION_PROMPT.format(
-                                    transcript=raw_text[:6000]
-                                )}],
-                                max_tokens=4096,
-                            )
-                            corrected = corrected.strip()
-                            if corrected and len(corrected) > len(raw_text) * 0.5:
-                                transcript_data["text"] = corrected
-                                logger.info(f"AI-corrected transcript for {dv.id}")
-                            else:
-                                logger.warning(f"AI correction returned suspicious result, keeping raw transcript")
-                        except Exception as e:
-                            logger.warning(f"AI transcript correction failed for {dv.id}: {e} — using raw Whisper output")
+                        corrected = await _ai_correct_transcript(user_settings, raw_text)
+                        if corrected and corrected != raw_text:
+                            transcript_data["text"] = corrected
+                            logger.info(f"AI-corrected transcript for {dv.id}")
 
                 # Step 2: AI insight extraction (include chapters context if available)
                 insights_json = None
@@ -288,6 +371,7 @@ class AnalyzerAgent:
                         )
                         # Parse JSON from response
                         response_clean = response.strip()
+                        response_clean = extract_json_text(response_clean)  # fence anywhere / leading prose (prompt_rules)
                         if response_clean.startswith("```"):
                             response_clean = response_clean.split("\n", 1)[1].rsplit("```", 1)[0]
                         try:
@@ -316,6 +400,7 @@ class AnalyzerAgent:
                                 max_tokens=1024,
                             )
                             seg_clean = seg_response.strip()
+                            seg_clean = extract_json_text(seg_clean)  # fence anywhere / leading prose (prompt_rules)
                             if seg_clean.startswith("```"):
                                 seg_clean = seg_clean.split("\n", 1)[1].rsplit("```", 1)[0]
                             try:
@@ -347,6 +432,7 @@ class AnalyzerAgent:
                                 max_tokens=1024,
                             )
                             imp_clean = imp_response.strip()
+                            imp_clean = extract_json_text(imp_clean)  # fence anywhere / leading prose (prompt_rules)
                             if imp_clean.startswith("```"):
                                 imp_clean = imp_clean.split("\n", 1)[1].rsplit("```", 1)[0]
                             try:
@@ -519,26 +605,33 @@ class AnalyzerAgent:
             await asyncio.to_thread(whisper_service.load, whisper_quality)
             await ws_manager.send_progress(job_id, 15, "Transcribing audio...", user_id)
             await update_job_status(job_id, "running", progress_pct=15, current_step="Transcribing audio...")
-            transcript_data = await whisper_service.transcribe(audio_path)
+            # Live transcription progress (15→38% of the job) — whisper streams
+            # a fraction per decoded segment; bridge the worker-thread callback
+            # onto the loop. DB write included so the /api/jobs poll path sees
+            # movement too, not just live WS clients.
+            _loop = asyncio.get_running_loop()
+
+            def _tx_progress(frac):
+                pct = 15 + frac * 23
+                step = f"Transcribing audio — {int(frac * 100)}%"
+                asyncio.run_coroutine_threadsafe(
+                    ws_manager.send_progress(job_id, pct, step, user_id), _loop)
+                asyncio.run_coroutine_threadsafe(
+                    update_job_status(job_id, "running", progress_pct=pct, current_step=step), _loop)
+
+            from backend.services.whisper_service import job_download_notice
+            transcript_data = await whisper_service.transcribe(
+                audio_path, quality=whisper_quality, on_progress=_tx_progress,
+                on_download=job_download_notice(job_id, user_id))
 
             await ws_manager.send_progress(job_id, 40, "Correcting transcript...", user_id)
 
-            # AI post-correction
+            # AI post-correction (chunked; never loses content)
             raw_text = transcript_data.get("text", "")
             if raw_text:
-                try:
-                    ai = get_ai_client(user_settings)
-                    corrected = await ai.chat(
-                        messages=[{"role": "user", "content": TRANSCRIPT_CORRECTION_PROMPT.format(
-                            transcript=raw_text[:6000]
-                        )}],
-                        max_tokens=4096,
-                    )
-                    corrected = corrected.strip()
-                    if corrected and len(corrected) > len(raw_text) * 0.5:
-                        transcript_data["text"] = corrected
-                except Exception as e:
-                    logger.warning(f"AI transcript correction failed: {e}")
+                corrected = await _ai_correct_transcript(user_settings, raw_text)
+                if corrected and corrected != raw_text:
+                    transcript_data["text"] = corrected
 
             await ws_manager.send_progress(job_id, 70, "Extracting insights...", user_id)
 
@@ -555,6 +648,7 @@ class AnalyzerAgent:
                         max_tokens=1024,
                     )
                     response_clean = response.strip()
+                    response_clean = extract_json_text(response_clean)  # fence anywhere / leading prose (prompt_rules)
                     if response_clean.startswith("```"):
                         response_clean = response_clean.split("\n", 1)[1].rsplit("```", 1)[0]
                     try:

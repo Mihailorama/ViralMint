@@ -12,9 +12,10 @@ class UserSettings(Base, TimestampMixin):
     user_id = Column(String(36), default="local", index=True)  # SaaS-ready
 
     # ── AI Provider (BYOK) ─────────────────────────────
-    ai_provider = Column(String(20), default="openai")              # "anthropic" | "openai"
+    ai_provider = Column(String(20), default="openai")              # "anthropic" | "openai" | "openrouter" | "openai_compatible"
     ai_model = Column(String(100), nullable=True)                   # Optional model override
     ai_api_key_encrypted = Column(Text, nullable=True)              # Optional per-user key (overrides .env)
+    ai_base_url = Column(String(500), nullable=True)                # OpenAI-compatible provider endpoint
 
     # ── Service API keys (BYOK — override .env per-user) ──
     youtube_api_key_encrypted = Column(Text, nullable=True)         # YouTube Data API v3 key
@@ -61,7 +62,7 @@ class UserSettings(Base, TimestampMixin):
     # ── Background Music ───────────────────────────────
     music_enabled = Column(Boolean, default=True)
     music_genre = Column(String(20), default="lofi")  # lofi|cinematic|upbeat|ambient|corporate
-    music_volume_db = Column(Float, default=-20.0)
+    music_volume_db = Column(Float, default=-14.0)
 
     # ── Instagram Upload ───────────────────────────────
     instagram_access_token_encrypted = Column(Text, nullable=True)

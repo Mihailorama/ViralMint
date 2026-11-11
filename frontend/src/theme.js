@@ -80,6 +80,17 @@ export default function createAppTheme(mode) {
           "*::-webkit-scrollbar-thumb:hover": {
             background: isDark ? "rgba(255,255,255,0.18)" : "rgba(0,0,0,0.18)",
           },
+          // Accessibility — a visible focus ring on keyboard-focused
+          // interactive elements. MUI's ButtonBase resets `outline: 0` and
+          // relies on a faint focus ripple, which many surfaces here hide, so
+          // Tab left no visible trace. :focus-visible keeps mouse clicks from
+          // drawing it. Components with a bespoke focus style still win on
+          // specificity.
+          "a:focus-visible, button:focus-visible, [role='button']:focus-visible, [tabindex]:focus-visible": {
+            outline: `2px solid ${alpha(P, isDark ? 0.9 : 0.8)}`,
+            outlineOffset: 2,
+            borderRadius: 8,
+          },
         },
       },
       MuiButton: {
@@ -114,6 +125,14 @@ export default function createAppTheme(mode) {
           },
           containedPrimary: {
             background: `linear-gradient(135deg, ${P}, #e88a5a)`,
+            // The gradient is a background-IMAGE, so MUI's disabled colour
+            // never showed through: a disabled primary button looked enabled
+            // on every page.
+            "&.Mui-disabled": {
+              background: isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.12)",
+              color: isDark ? "rgba(255,255,255,0.38)" : "rgba(0,0,0,0.38)",
+              boxShadow: "none",
+            },
             "&:hover": {
               background: `linear-gradient(135deg, #b85838, #d47a4e)`,
               boxShadow: `${s.md}, ${s.glow}`,
@@ -174,6 +193,16 @@ export default function createAppTheme(mode) {
       MuiChip: {
         styleOverrides: {
           root: { fontWeight: 500, borderRadius: 8 },
+          // A filled status chip is white text on the palette colour, and
+          // `success.main` (#16a34a) gives white only 3.30:1 — under the 4.5:1
+          // floor for text this small. Measured on /scout, where a whole grid
+          // of "Downloaded" chips sits on one screen, and it reads the same in
+          // both themes because the palette entry has no per-mode variant.
+          //
+          // Fixed HERE and not on `success.main`, which is also drawn as text
+          // and as icons on the dark canvas — darkening the palette would fix
+          // the chip and make those worse.
+          filledSuccess: { backgroundColor: "#12883e" },   // 4.55:1 vs white
           outlined: {
             borderColor: isDark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.1)",
             transition: "all 0.15s ease",
@@ -278,6 +307,32 @@ export default function createAppTheme(mode) {
               fontWeight: 700,
               backgroundColor: isDark ? "rgba(201,100,66,0.06)" : "rgba(201,100,66,0.04)",
             },
+          },
+        },
+      },
+      // Segmented controls had NO theme entry, so every call site styled
+      // itself and the same widget rendered several different ways on one
+      // screen. Giving the component a home here is the same rule the caption
+      // enum and the tool job-type map follow: one source, and a call site
+      // that disagrees is now visibly disagreeing.
+      MuiToggleButtonGroup: {
+        styleOverrides: {
+          root: { borderRadius: 10 },
+          grouped: {
+            borderRadius: 10,
+            // MUI zeroes the inner corners of a group; restore them so the
+            // ends stay rounded and the seams stay square.
+            "&:not(:first-of-type)": { borderTopLeftRadius: 0, borderBottomLeftRadius: 0 },
+            "&:not(:last-of-type)": { borderTopRightRadius: 0, borderBottomRightRadius: 0 },
+          },
+        },
+      },
+      MuiToggleButton: {
+        styleOverrides: {
+          root: {
+            textTransform: "none",
+            fontWeight: 600,
+            borderRadius: 10,
           },
         },
       },

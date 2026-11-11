@@ -17,16 +17,18 @@ thumbnail) are NOT ported — they need cloud media-gen providers OSS lacks.
 """
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 
 from backend.config import settings as app_settings
 from backend.database import AsyncSessionLocal
 from backend.models.job import Job
+from backend.services.caption_service import CAPTION_STYLES as _CAPTION_STYLE_DEFS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -44,6 +46,46 @@ VIDEO_MAX_BYTES = 1000 * 1024 * 1024  # 1000 MB
 LOGO_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+# The Audio tools take audio as well as video. They used to validate against
+# VIDEO_EXTS alone, so a podcast mp3 was rejected with a 400 AFTER the upload
+# had been sent — on the tools whose whole job is the audio track.
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
+
+# Caption styles this API accepts — DERIVED from the caption engine so the
+# surfaces can't drift again. `brainrot` is excluded: it is a look applied by
+# its own pipeline, not a general caption preset.
+#
+# This was hardcoded to ("viral", "classic", "bold") long after the engine grew
+# to eleven, so the Captions tool offered three of them and posting any of the
+# other seven came back 422.
+_CAPTION_STYLE_IDS = tuple(k for k in _CAPTION_STYLE_DEFS if k != "brainrot")
+CaptionStyleId = Literal[_CAPTION_STYLE_IDS]
+
+
+async def read_upload_capped(file: UploadFile, max_bytes: int,
+                             label: str = "File") -> bytes:
+    """Read an upload into memory, aborting AT the cap rather than after it.
+
+    `await file.read()` materializes the whole body before any size check can
+    reject it, so a multi-gigabyte upload costs the memory whether or not it is
+    allowed. Reading in chunks and stopping one byte over the limit turns that
+    into a cheap 413.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1 << 20)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                413, f"{label} too large (max {max_bytes // 1024 // 1024} MB)")
+        chunks.append(chunk)
+    if not total:
+        raise HTTPException(400, f"{label} is empty")
+    return b"".join(chunks)
 
 
 async def save_upload(
@@ -91,8 +133,15 @@ def safe_tools_path(path_str: str) -> Path:
     return p
 
 
-# Output extension → content-type. Shared by the download response and the
-# lightweight /download-meta probe the frontend uses to pick a preview element.
+# Output extension → content-type, for the lightweight /download-meta probe
+# the frontend uses to PICK a preview element (it branches on
+# `content_type.startsWith("video/")`, which is why the default here is
+# video/mp4 rather than octet-stream).
+#
+# The download response itself no longer reads this map: it goes through
+# `videos.serve_media_with_range`, which types the bytes off the same map every
+# other media route uses. Keep this one to the question it answers — "which
+# element should render this?" — and don't grow it into a second MIME table.
 _TOOL_OUTPUT_MEDIA = {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
@@ -145,7 +194,7 @@ async def download_meta(job_id: str):
 
 
 @router.get("/download/{job_id}")
-async def download_tool_result(job_id: str):
+async def download_tool_result(job_id: str, request: Request):
     """Serve the output of a completed tool job."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Job).where(Job.id == job_id))
@@ -163,12 +212,14 @@ async def download_tool_result(job_id: str):
         raise HTTPException(404, "Output file no longer on disk (expired?)")
 
     tool_label = job.job_type.replace(":", "_")
-    ext = path.suffix.lower()
-    media = _TOOL_OUTPUT_MEDIA.get(ext, "video/mp4")
-    return FileResponse(
-        path, media_type=media,
-        filename=f"viralmint_{tool_label}{path.suffix}",
-    )
+    # Range-aware, because this route is not only a download: ToolRunner
+    # mounts it as the result preview's `<video src>`, so it is scrubbed as
+    # often as it is saved. A request with no Range (which is what the
+    # Download button sends) still gets the whole file with the filename
+    # attached.
+    from backend.api.videos import serve_media_with_range
+    return serve_media_with_range(
+        path, request, filename=f"viralmint_{tool_label}{path.suffix}")
 
 
 # ── Tool endpoints ─────────────────────────────────────────────────────────────
@@ -177,7 +228,7 @@ async def download_tool_result(job_id: str):
 @router.post("/captions")
 async def captions_tool(
     file: UploadFile = File(...),
-    style: Literal["viral", "classic", "bold"] = Form("viral"),
+    style: CaptionStyleId = Form("viral"),
     emoji_style: Literal["none", "minimal", "moderate", "heavy"] = Form("moderate"),
 ):
     from backend.agents.job_helper import create_job
@@ -210,7 +261,7 @@ async def audio_enhance_tool(
     from backend.core.task_runner import dispatch
     from backend.core.tool_runners import run_tool_audio_enhance
     job = await create_job("tool:audio_enhance", "local", {})
-    in_path = await save_upload(file, job.id, VIDEO_EXTS, VIDEO_MAX_BYTES)
+    in_path = await save_upload(file, job.id, MEDIA_EXTS, VIDEO_MAX_BYTES)
     dispatch(run_tool_audio_enhance(job.id, in_path))
     return {"job_id": job.id}
 
@@ -278,7 +329,7 @@ async def remove_silence_tool(
     from backend.core.task_runner import dispatch
     from backend.core.tool_runners import run_tool_remove_silence
     job = await create_job("tool:remove_silence", "local", {})
-    in_path = await save_upload(file, job.id, VIDEO_EXTS, VIDEO_MAX_BYTES)
+    in_path = await save_upload(file, job.id, MEDIA_EXTS, VIDEO_MAX_BYTES)
     dispatch(run_tool_remove_silence(job.id, in_path))
     return {"job_id": job.id}
 
@@ -448,9 +499,15 @@ async def enhance_prompt(
 async def voiceover_tool(
     text: str = Form(...),
     voice_id: Optional[str] = Form(None),
+    provider: str = Form("edge_tts"),
     video: Optional[UploadFile] = File(None),
 ):
-    """Generate a voice-over from a script using the local (free) Edge TTS.
+    """Generate a voice-over from a script.
+
+    `provider` is "edge_tts" (free, local) or "openai_tts" (your own key). It
+    used to be absent, so the page's provider picker was decorative and an
+    OpenAI voice id reached Edge TTS, which rejects it — the job simply failed.
+    A paid provider with no key degrades to Edge with a constraint warning.
 
     If a video is also uploaded, the voice is overlaid on top of it.
     """
@@ -464,7 +521,7 @@ async def voiceover_tool(
     from backend.core.task_runner import dispatch
     from backend.core.tool_runners import run_tool_voiceover
     job = await create_job("tool:voiceover", "local", {
-        "voice_id": voice_id, "chars": len(text),
+        "voice_id": voice_id, "provider": provider, "chars": len(text),
     })
 
     video_path = None
@@ -473,18 +530,19 @@ async def voiceover_tool(
 
     dispatch(run_tool_voiceover(
         job.id, text, voice_id or "",
-        video_path=video_path,
+        video_path=video_path, provider=provider,
     ))
     return {"job_id": job.id}
 
 
 @router.post("/transform")
 async def transform_tool(
-    operation: Literal["flip_h", "flip_v", "rotate_cw", "rotate_ccw", "rotate_180", "loop", "volume"] = Form(...),
+    operation: Literal["flip_h", "flip_v", "rotate_cw", "rotate_ccw", "rotate_180",
+                       "loop", "volume", "mute"] = Form(...),
     amount: str = Form(""),
     file: UploadFile = File(...),
 ):
-    """Quick local video transforms: flip / rotate / loop / volume."""
+    """Quick local video transforms: flip / rotate / loop / volume / mute."""
     from backend.agents.job_helper import create_job
     from backend.core.task_runner import dispatch
     from backend.core.tool_runners import run_tool_transform
@@ -536,9 +594,12 @@ async def gif_tool(
         raise HTTPException(400, "fps must be 5-30")
     if not 240 <= width <= 1080:
         raise HTTPException(400, "width must be 240-1080")
-    if start_seconds < 0:
-        raise HTTPException(400, "start_seconds must be >= 0")
-    if duration_seconds < 0 or duration_seconds > 60:
+    # Two-sided so NaN/inf are rejected rather than reaching ffmpeg — see the
+    # note on the same pair in /trim.
+    from backend.services.video_utils import MAX_MEDIA_SECONDS
+    if not 0.0 <= start_seconds <= MAX_MEDIA_SECONDS:
+        raise HTTPException(400, "start_seconds must be a number >= 0")
+    if not 0.0 <= duration_seconds <= 60.0:
         raise HTTPException(400, "duration_seconds must be 0-60 (0 means whole video)")
 
     from backend.agents.job_helper import create_job
@@ -655,8 +716,15 @@ async def trim_tool(
 
     Pure FFmpeg, frame-accurate (re-encode, not keyframe-snapped).
     """
-    if start_seconds < 0:
-        raise HTTPException(400, "start_seconds must be >= 0")
+    # Bounded on BOTH sides, not `< 0`: NaN fails every comparison, so the
+    # one-sided form passed it through all three checks below and handed ffmpeg
+    # `-ss nan` (a Form float parses "nan"/"inf" happily). The same defect the
+    # clip pipeline's timestamp parser carried.
+    from backend.services.video_utils import MAX_MEDIA_SECONDS
+    if not 0.0 <= start_seconds <= MAX_MEDIA_SECONDS:
+        raise HTTPException(400, "start_seconds must be a number >= 0")
+    if not 0.0 < end_seconds <= MAX_MEDIA_SECONDS:
+        raise HTTPException(400, "end_seconds must be a number > 0")
     if end_seconds <= start_seconds:
         raise HTTPException(400, "end_seconds must be greater than start_seconds")
     if end_seconds - start_seconds < 0.5:
@@ -686,6 +754,99 @@ async def subtitles_tool(
     job = await create_job("tool:subtitle_export", "local", {"format": format})
     in_path = await save_upload(file, job.id, VIDEO_EXTS, VIDEO_MAX_BYTES)
     dispatch(run_tool_subtitles(job.id, in_path, fmt=format))
+    return {"job_id": job.id}
+
+
+@router.post("/transcript")
+async def transcript_tool(
+    url: str = Form(...),
+    language: str = Form(""),
+    format: Literal["txt", "srt", "vtt"] = Form("txt"),
+):
+    """Download a video's EXISTING caption track from its URL — no transcription.
+
+    The sibling of `/subtitles`: instead of uploading a video and running
+    Whisper over it, this reads the subtitle stream the platform already
+    publishes (creator-uploaded, else auto-generated). Seconds instead of
+    minutes. A source with no caption track fails and says so — it never falls
+    back to transcribing.
+
+    `language` is an optional 2-letter ISO code; empty means "whatever the
+    video has" (its own language first, then en→zh→ja→ko→es→fr→de→pt→ru→ar).
+    """
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")) or len(url) > 2000:
+        raise HTTPException(400, "Enter a valid http(s) video URL")
+
+    language = (language or "").strip().lower()
+    if language and not re.fullmatch(r"[a-z]{2}", language):
+        raise HTTPException(400, "language must be a 2-letter code (e.g. 'en')")
+
+    from backend.agents.job_helper import create_job
+    from backend.core.task_runner import dispatch
+    from backend.core.tool_runners import run_tool_transcript
+    job = await create_job("tool:transcript", "local", {
+        "url": url, "language": language, "format": format,
+    })
+    dispatch(run_tool_transcript(job.id, url, language=language or None, fmt=format))
+    return {"job_id": job.id}
+
+
+@router.post("/compress")
+async def compress_tool(
+    file: UploadFile = File(...),
+    resolution: Literal[
+        "original", "1280x720", "854x480", "640x360", "426x240"
+    ] = Form("original"),
+    level: Literal["maximum", "high", "medium", "low", "minimal"] = Form("high"),
+):
+    """Re-encode a video smaller — for email, chat apps and upload limits.
+
+    Two independent axes: `resolution` (keep the source size, or scale down to
+    a named height) and `level` (how hard to squeeze at that size). Local
+    FFmpeg only. Asking for a resolution TALLER than the source keeps the
+    source size rather than upscaling; the job reports it.
+    """
+    from backend.agents.job_helper import create_job
+    from backend.core.task_runner import dispatch
+    from backend.core.tool_runners import run_tool_compress
+    job = await create_job("tool:compress", "local", {
+        "resolution": resolution, "level": level,
+    })
+    in_path = await save_upload(file, job.id, VIDEO_EXTS, VIDEO_MAX_BYTES)
+    dispatch(run_tool_compress(job.id, in_path, resolution=resolution, level=level))
+    return {"job_id": job.id}
+
+
+@router.post("/crop")
+async def crop_tool(
+    file: UploadFile = File(...),
+    x: float = Form(...),
+    y: float = Form(...),
+    w: float = Form(...),
+    h: float = Form(...),
+):
+    """Crop a video to a rectangle you drew on the frame.
+
+    The box arrives NORMALIZED (0-1, origin top-left) so it's independent of
+    whatever size the preview was rendered at — the runner converts against
+    the real source dimensions. The manual counterpart to `/reframe`, which
+    picks the framing for you.
+    """
+    for name, value in (("x", x), ("y", y), ("w", w), ("h", h)):
+        if not 0.0 <= value <= 1.0:
+            raise HTTPException(400, f"{name} must be between 0 and 1")
+    if w <= 0 or h <= 0:
+        raise HTTPException(400, "Drag a crop box over the frame first")
+
+    from backend.agents.job_helper import create_job
+    from backend.core.task_runner import dispatch
+    from backend.core.tool_runners import run_tool_crop
+    job = await create_job("tool:crop", "local", {
+        "x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4),
+    })
+    in_path = await save_upload(file, job.id, VIDEO_EXTS, VIDEO_MAX_BYTES)
+    dispatch(run_tool_crop(job.id, in_path, x, y, w, h))
     return {"job_id": job.id}
 
 

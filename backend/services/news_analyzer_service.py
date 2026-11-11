@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 from typing import Optional
+from backend.core.prompt_rules import OUTPUT_LANGUAGE_RULE, extract_json_text
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +26,8 @@ Published: {published_at}
 Article text:
 {full_text}
 
-1. FILTER: Is this article high-quality and relevant to the query? If it's clickbait with no substance, a stub/paywall, or completely off-topic — set virality_score to 0.
-2. SCORE: Rate viral video potential 0-100 based on: controversy, novelty, emotional impact, broad appeal, timeliness. Be generous — most real news from reputable sources should score 30-50+. Only score 0 for true garbage.
+1. FILTER: Is this article relevant to the query? If it's completely off-topic — set virality_score to 0. Note: if only a title/headline is provided (no full text), score based on the headline's news value — do NOT penalize for missing text.
+2. SCORE: Rate viral video potential 0-100 based on: controversy, novelty, emotional impact, broad appeal, timeliness. Be generous — most real news from reputable sources should score 30-60+. Only score 0 for completely irrelevant articles.
 3. ANALYZE: Provide deep analysis useful for creating a video.
 
 Return ONLY this JSON object, no explanation or markdown fences:
@@ -45,6 +46,7 @@ Return ONLY this JSON object, no explanation or markdown fences:
   "target_audience": "who would watch this video",
   "related_context": "background context that adds depth to the story"
 }}"""
+SINGLE_ARTICLE_PROMPT += "\n\n" + OUTPUT_LANGUAGE_RULE  # state the language — Claude does not infer it (prompt_rules)
 
 
 async def _analyze_one(
@@ -60,10 +62,19 @@ async def _analyze_one(
     from backend.core.ai_provider import get_ai_client
 
     text = article.get("full_text") or article.get("summary") or ""
-    if not text:
+    title = article.get("title", "")
+    if not text and not title:
         article["virality_score"] = 0
         article["analysis"] = {"error": "No article text available"}
         return article
+
+    # Headline-only is a normal outcome, not a failure: Google News links go
+    # through a redirector whose target often can't be resolved, so the scraper
+    # comes back with a title and nothing else. Scoring those zero threw away
+    # most of a news scout's results. The prompt is told not to penalise a
+    # missing body so a strong headline can still score.
+    if not text:
+        text = title
 
     prompt = SINGLE_ARTICLE_PROMPT.format(
         query=query,
@@ -83,7 +94,7 @@ async def _analyze_one(
                     max_tokens=1024,
                 )
 
-                cleaned = response.strip()
+                cleaned = extract_json_text(response)  # fence anywhere / leading prose (prompt_rules)
                 if cleaned.startswith("```"):
                     cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
                 analysis = json.loads(cleaned)

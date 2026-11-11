@@ -9,11 +9,13 @@ import { pluginRoutes } from "./plugins"
 // Route-level code splitting — only Chat is eagerly loaded (home page)
 import Chat from "./pages/Chat"
 const Settings = lazy(() => import("./pages/Settings"))
-const Videos = lazy(() => import("./pages/Videos"))
+const Library = lazy(() => import("./pages/Library"))
+const Scout = lazy(() => import("./pages/Scout"))
 const StockVideo = lazy(() => import("./pages/StockVideo"))
 const Channels = lazy(() => import("./pages/Channels"))
 const Messaging = lazy(() => import("./pages/Messaging"))
 const ClipStudio = lazy(() => import("./pages/ClipStudio"))
+const MotionGraphics = lazy(() => import("./pages/MotionGraphics"))
 const Tools = lazy(() => import("./pages/Tools"))
 
 // Tools — single-purpose utility pages. Each is a thin wrapper around the
@@ -28,6 +30,7 @@ const ToolGif = lazy(() => import("./pages/tools/Gif"))
 const ToolSpeed = lazy(() => import("./pages/tools/Speed"))
 const ToolTrim = lazy(() => import("./pages/tools/Trim"))
 const ToolSubtitles = lazy(() => import("./pages/tools/Subtitles"))
+const ToolTranscript = lazy(() => import("./pages/tools/Transcript"))
 const ToolAutoZoom = lazy(() => import("./pages/tools/AutoZoom"))
 const ToolTransform = lazy(() => import("./pages/tools/Transform"))
 const ToolMusicVisualizer = lazy(() => import("./pages/tools/MusicVisualizer"))
@@ -36,6 +39,9 @@ const ToolHookAnalysis = lazy(() => import("./pages/tools/HookAnalysis"))
 const ToolTranslate = lazy(() => import("./pages/tools/Translate"))
 const ToolMetadata = lazy(() => import("./pages/tools/Metadata"))
 const ToolAutoChapters = lazy(() => import("./pages/tools/AutoChapters"))
+const ToolCompress = lazy(() => import("./pages/tools/Compress"))
+const ToolCrop = lazy(() => import("./pages/tools/Crop"))
+const ToolVideoDownload = lazy(() => import("./pages/tools/VideoDownload"))
 
 const LazyFallback = () => (
   <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", height: "100%", minHeight: 200 }}>
@@ -86,13 +92,20 @@ export default function App() {
             <Route path="/" element={<Layout />}>
               <Route index element={<Chat />} />
               <Route path="dashboard" element={<Navigate to="/videos" />} />
-              <Route path="videos" element={<Videos />} />
+              {/* `/videos` is the Library. The path is legacy and stays: it is
+                  bookmarked, and every ?tab= link the old page published still
+                  arrives here and is translated into the new filters. */}
+              <Route path="videos" element={<Library />} />
+              {/* Scout leads are not files you own, so they are not the
+                  Library. `/videos?tab=scout` redirects here. */}
+              <Route path="scout" element={<Scout />} />
               <Route path="stock" element={<StockVideo />} />
               <Route path="ai-video" element={<Navigate to="/stock" />} />
               <Route path="avatar" element={<Navigate to="/stock" />} />
               <Route path="create" element={<Navigate to="/stock" />} />
               <Route path="cron" element={<Navigate to="/" />} />
               <Route path="clips" element={<ClipStudio />} />
+              <Route path="motion" element={<MotionGraphics />} />
               <Route path="tools" element={<Tools />} />
               <Route path="tools/captions" element={<ToolCaptions />} />
               <Route path="tools/reframe" element={<ToolReframe />} />
@@ -104,8 +117,12 @@ export default function App() {
               <Route path="tools/speed" element={<ToolSpeed />} />
               <Route path="tools/trim" element={<ToolTrim />} />
               <Route path="tools/subtitles" element={<ToolSubtitles />} />
+              <Route path="tools/transcript" element={<ToolTranscript />} />
               <Route path="tools/auto-zoom" element={<ToolAutoZoom />} />
               <Route path="tools/transform" element={<ToolTransform />} />
+              <Route path="tools/compress" element={<ToolCompress />} />
+              <Route path="tools/crop" element={<ToolCrop />} />
+              <Route path="tools/video-download" element={<ToolVideoDownload />} />
               <Route path="tools/music-visualizer" element={<ToolMusicVisualizer />} />
               <Route path="tools/voiceover" element={<ToolVoiceover />} />
               <Route path="tools/hook-analysis" element={<ToolHookAnalysis />} />

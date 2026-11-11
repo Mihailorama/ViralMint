@@ -7,10 +7,19 @@ import logging
 import platform
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from backend.config import settings
-from backend.core.exceptions import DownloadError, VideoUnavailableError, RateLimitError
+from backend.core.exceptions import (
+    DownloadError,
+    DownloadStalledError,
+    DownloadTimeoutError,
+    NoCaptionsError,
+    RateLimitError,
+    VideoUnavailableError,
+)
+from backend.core.executors import PoolExhaustedError, download_pool
 from backend.core.http_utils import get_user_agent
 
 logger = logging.getLogger(__name__)
@@ -43,22 +52,158 @@ class _YtDlpLogger:
         logger.error(msg)
 
 
+# curl-cffi browser impersonation — replays Chrome's TLS handshake (JA3
+# fingerprint) so sites with TLS-aware bot defenses (Cloudflare/Akamai)
+# can't fingerprint the client by handshake alone. Wrapped in try/except so
+# a missing or version-incompatible curl-cffi NEVER breaks downloads —
+# they just fall back to urllib's default fingerprint.
+#
+# Requires curl-cffi >= 0.15 (see the pin note in requirements.txt): 0.14's
+# streaming path resets a libcurl handle from a done-callback while the
+# calling thread is still reading it, which SIGABRTs the whole backend
+# process. TikTok's extractor forces impersonate=True, so that is every
+# TikTok probe and download.
+_IMPERSONATE_TARGET = None
+try:
+    import curl_cffi  # noqa: F401  (presence test; yt-dlp loads its own handler)
+    from yt_dlp.networking.impersonate import ImpersonateTarget as _ImpersonateTarget
+    _IMPERSONATE_TARGET = _ImpersonateTarget("chrome")
+except Exception as _e:  # noqa: BLE001
+    logger.info("curl-cffi impersonation unavailable: %s — downloads use urllib fingerprint", _e)
+
+
 def _yt_dlp_base_opts() -> dict:
-    """Base options for all yt-dlp calls — quiet mode + logger redirect."""
-    return {
+    """Base options for all yt-dlp calls — quiet mode + logger redirect.
+
+    `format_sort` declares preference order for the picked format. `lang` is
+    FIRST so that on YouTube multi-language videos we pick the ORIGINAL audio
+    track — without it, plain `bestaudio` sorted by bitrate alone, which on
+    multi-language videos commonly picked a dub (observed: an English video
+    downloading with Portuguese audio). No-op for non-YouTube sources.
+
+    `retry_sleep_functions` aligns with yt-dlp's documented best practice for
+    resilience under rate limits: exponential backoff per retry-pool instead
+    of a static sleep that wastes retry budget.
+
+    `throttledratelimit` catches stale signed URLs that "succeed" but trickle
+    bytes — yt-dlp re-extracts from scratch when speed drops below it.
+
+    `impersonate` enables curl-cffi browser fingerprinting when the lib is
+    importable; otherwise omitted (no-op fallback to urllib).
+    """
+    opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "logger": _YtDlpLogger(),
+        "format_sort": ["lang", "res:1080", "fps", "codec:avc:m4a", "size", "br"],
+        "retry_sleep_functions": {
+            "http":        lambda n: min(60, 2 ** n),         # 1, 2, 4, 8, 16, 32, 60...
+            "fragment":    lambda n: min(120, 2 * (n + 1)),   # 2, 4, 6, 8... (linear, capped)
+            "file_access": lambda n: 0.5 * n,                 # quick disk retries
+        },
+        "throttledratelimit": 100_000,  # 100 KB/s
     }
+    if _IMPERSONATE_TARGET is not None:
+        opts["impersonate"] = _IMPERSONATE_TARGET
+    return opts
+
+
+# JS-runtime discovery cache. A positive result is process-lifetime (a runtime
+# doesn't move once found); a NEGATIVE result is deliberately not cached, so a
+# user who installs Node or deno mid-session benefits on the very next
+# download. The cost is two shutil.which calls — noise next to a yt-dlp run.
+_JS_RUNTIMES_RESOLVED: dict | None = None
+_warned_no_js_runtime = False
+
+
+def _resolve_js_runtimes() -> dict:
+    """Build yt-dlp's `js_runtimes` dict from what this machine actually has.
+
+    Why discovery instead of a static pin: this used to be hardcoded
+    `{"node": {}}`, which carried two silent failure modes on a machine
+    without Node (the common case for packaged desktop users — the app bundles
+    no JS runtime):
+
+      1. Explicitly passing js_runtimes REPLACES yt-dlp's default, so the
+         hardcoded pin also disabled the `deno` default — a user with deno but
+         not node got NO runtime instead of one.
+      2. With no runtime the EJS challenge solver can't run, n-signature
+         challenges go unsolved, and YouTube formats go missing or 403 —
+         indistinguishable in a bug report from a cookie problem.
+
+    Nothing found → pass the default-shaped {'deno': {}} through and log ONE
+    clear warning naming the consequence, instead of letting yt-dlp's buried
+    per-download warning be the only signal.
+    """
+    global _JS_RUNTIMES_RESOLVED, _warned_no_js_runtime
+    if _JS_RUNTIMES_RESOLVED is not None:
+        return dict(_JS_RUNTIMES_RESOLVED)
+
+    runtimes: dict = {}
+    if shutil.which("deno"):
+        runtimes["deno"] = {}
+    if shutil.which("node"):
+        runtimes["node"] = {}
+
+    if runtimes:
+        _JS_RUNTIMES_RESOLVED = dict(runtimes)
+        return dict(runtimes)
+
+    # Nothing found. Don't cache — the user may install a runtime later.
+    if not _warned_no_js_runtime:
+        _warned_no_js_runtime = True
+        logger.warning(
+            "No JavaScript runtime (deno/node) found — YouTube n-signature "
+            "challenges can't be solved, so some formats will be missing or "
+            "fail with HTTP 403. Installing Node.js or deno fixes this."
+        )
+    return {"deno": {}}
 
 
 def _yt_dlp_js_opts() -> dict:
-    """Enable Node.js runtime + EJS challenge solver for YouTube extraction.
-    Without these, yt-dlp ≥ 2026.03 may fail to extract video formats."""
+    """Enable a JS runtime + EJS challenge solver for YouTube extraction,
+    plus the per-extractor tweaks that keep the flaky sites working.
+
+    Runtime selection is machine-aware — see `_resolve_js_runtimes`.
+
+    - **youtube**: cycle player clients, leading with the three that yt-dlp's
+      PO Token Guide lists as NOT requiring a token (tv, web_embedded,
+      android_vr) — when one client gets bot-blocked, the next takes over.
+      `webpage_client` controls the identity for the initial page scrape,
+      distinct from the streaming-URL request. `formats: missing_pot` allows
+      degraded-quality formats over no download at all.
+    - **youtubetab**: `skip=authcheck` — with cookies present, public channel
+      extraction otherwise fails an unnecessary auth check.
+    - **tiktok**: `app_info=[""]` triggers the genuine-device-id flow (most
+      stable); app versions match TikTok's current mobile app.
+    - **twitter**: force the syndication API — the default graphql path 403s
+      guest-token requests for most tweets.
+    - **instagram/reddit**: bump extractor retries (known to flake).
+    """
     return {
-        "js_runtimes": {"node": {}},
+        "js_runtimes": _resolve_js_runtimes(),
         "remote_components": {"ejs:github": {}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": [
+                    "tv", "web_embedded", "android_vr",   # no-token (lead)
+                    "tv_simply", "ios", "mweb",            # token-gated fallbacks
+                    "web_safari", "web",                    # last resort
+                ],
+                "webpage_client": ["web"],
+                "formats": ["missing_pot"],
+            },
+            "youtubetab": {"skip": ["authcheck"]},
+            "tiktok": {
+                "app_info": [""],
+                "app_version": ["35.1.3"],
+                "manifest_app_version": ["2023501030"],
+            },
+            "twitter": {"api": ["syndication"]},
+            "instagram": {"extractor_retries": ["5"]},
+            "reddit": {"extractor_retries": ["5"]},
+        },
     }
 
 
@@ -126,8 +271,13 @@ def _try_update_ytdlp() -> bool:
 
     try:
         logger.info("Auto-updating yt-dlp...")
+        # Version-bounded spec: on an environment whose Python is too old for
+        # current yt-dlp, an unbounded "-U yt-dlp" silently resolves to an
+        # ANCIENT release (macOS system python3 = 3.9 → a 2025.10 build that
+        # fails on modern YouTube). Bounded, pip errors loudly instead of
+        # installing a silently-broken downloader.
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+            [sys.executable, "-m", "pip", "install", "-U", "yt-dlp>=2026.7.4"],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0:
@@ -330,6 +480,23 @@ def _apply_cookies(opts: dict):
             opts["cookiesfrombrowser"] = (browser,)
 
 
+def _drop_cookies_for_403(opts: dict) -> bool:
+    """Remove the cookie jar from `opts` after an HTTP 403. True if it changed.
+
+    This is NOT a give-up step. On YouTube, supplying ANY cookie makes yt-dlp
+    skip every player client that can't carry one — `android_vr`, `tv_simply`,
+    `ios` (visible in logs as `Skipping client "android_vr" since it does not
+    support cookies`). Those are exactly the clients yt-dlp's PO-Token guide
+    lists as token-free, so what remains hands back stream URLs that need an
+    n-signature solve; without a JS runtime that can't happen and googlevideo
+    answers 403. Dropping the jar puts the token-free clients back in play.
+    """
+    had = "cookiefile" in opts or "cookiesfrombrowser" in opts
+    opts.pop("cookiefile", None)
+    opts.pop("cookiesfrombrowser", None)
+    return had
+
+
 def _is_bot_detection_error(error_str: str) -> bool:
     """Check if the error is a YouTube bot detection / sign-in required error."""
     indicators = ["sign in to confirm", "not a bot", "cookies-from-browser", "login required"]
@@ -398,7 +565,9 @@ def _extract_audio_locally(video_path: Path, audio_dir: Path, filename_stem: str
         )
         if result.returncode == 0 and audio_path.exists() and audio_path.stat().st_size > 0:
             return audio_path
-        logger.warning(f"FFmpeg audio extraction returned {result.returncode}: {result.stderr[:200]}")
+        from backend.services.ffmpeg_service import ffmpeg_error
+        logger.warning("FFmpeg audio extraction returned %s: %s",
+                       result.returncode, ffmpeg_error(result.stderr, 200))
     except subprocess.TimeoutExpired:
         logger.warning(f"FFmpeg audio extraction timed out for {video_path}")
     except FileNotFoundError:
@@ -418,6 +587,10 @@ def _cleanup_subtitle_files(output_dir: Path, filename_stem: str):
 
 def _cleanup_partial_files(output_dir: Path, filename_stem: str):
     """Remove leftover .part files from failed/interrupted downloads."""
+    # An empty stem globs `*.part` — every in-flight download's part-files in
+    # the directory, not just this one's.
+    if not filename_stem:
+        return
     cleaned = 0
     for f in output_dir.glob(f"{filename_stem}*.part"):
         try:
@@ -429,23 +602,373 @@ def _cleanup_partial_files(output_dir: Path, filename_stem: str):
         logger.info(f"Cleaned up {cleaned} partial file(s) for {filename_stem}")
 
 
+# ── Stall detection ─────────────────────────────────────────────────────────
+#
+# The wall-clock `wait_for` that used to wrap a download was not a progress
+# check, and it did not stop anything either. yt-dlp's retry budget (socket
+# timeouts, retries with exponential backoff, fragment retries, times the
+# rungs of FORMAT_FALLBACK_CHAIN) can consume the whole cap without a single
+# byte arriving — a job sat at "Downloading…" for the full budget with no
+# error — and when the timeout finally fired, `asyncio.wait_for` could not
+# cancel the thread: it kept running, holding a worker of the ONE executor
+# every `asyncio.to_thread` call in the app shares. Enough of those and every
+# request that touches `to_thread` hangs until a restart.
+#
+# So downloads run on their own bounded pool (backend/core/executors.py), and
+# progress is measured here. `_DownloadProgress` is written by yt-dlp's hooks
+# on the worker thread and read by `_await_with_stall_guard` on the event
+# loop, hence the lock.
+
+# How often the guard wakes to compare notes with the tracker. Small enough
+# to react promptly, large enough to be free next to a network transfer.
+_STALL_POLL_S = 1.0
+
+# How often the guard stats the attempt's files on disk. A glob of the videos
+# directory is cheap but not free on a large Library, and the stall budget is
+# measured in minutes, so a coarser cadence loses nothing.
+_DISK_POLL_S = 10.0
+
+# Wall-clock cap, named so it is visible and patchable in a test rather than
+# buried as a literal at the call site. Same 20 minutes as before.
+VIDEO_HARD_TIMEOUT_S = 1200
+
+
+def _stem_footprint(*locations: tuple[Path, str | None]) -> int:
+    """Total bytes of every file named `<stem>*` in each (dir, stem) pair.
+
+    Covers what a download attempt writes under its stem: `.part` files,
+    HLS `.part-FragN` fragments, `.f<id>.<ext>` DASH streams, `.temp.*`
+    merge output, the final file, and the `_audio.mp3` extracted after it.
+    A stem that is still a yt-dlp template (`%(id)s`) or absent cannot be
+    globbed and is skipped. Never raises — a stat racing a rename or a
+    cleanup is simply not counted.
+    """
+    total = 0
+    for directory, stem in locations:
+        if not stem or "%" in stem:
+            continue
+        try:
+            for f in Path(directory).glob(f"{glob.escape(stem)}*"):
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return total
+
+
+def _now() -> float:
+    """Monotonic clock for the stall guard's WALL-CLOCK budget.
+
+    Indirected purely so a test can fast-forward the cap without
+    monkeypatching `time.monotonic` itself — that module is shared with
+    asyncio's own scheduler, so patching it corrupts the event loop's timers
+    and the test stops testing anything.
+    """
+    return time.monotonic()
+
+
+class _DownloadProgress:
+    """Byte-level progress of one download attempt, shared thread↔loop.
+
+    `idle_seconds()` returns None while a postprocessor is running. That is
+    the single most important behaviour here: an ffmpeg merge of a long 4K
+    file reports no download progress for many minutes, and killing a
+    *finished* download during its merge would throw away exactly the work
+    the user waited for. During postprocessing only the hard wall clock
+    applies.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self, *, queued: bool = False) -> None:
+        """Start a fresh attempt.
+
+        `queued=True` means the work has been handed to a pool but no worker
+        has picked it up yet: the stall clock stays OFF until
+        `mark_started()`. A download waiting for a free worker cannot move a
+        byte, and charging that wait to the stall budget would fail queued
+        downloads as "stalled" before yt-dlp ever ran (the pool's own
+        admission timeout bounds the wait instead).
+        """
+        with self._lock:
+            self._bytes = 0
+            self._peak = 0
+            self._last_activity = time.monotonic()
+            self._postprocessing = False
+            self._started = not queued
+            self._disk = None
+
+    def mark_started(self) -> None:
+        """A worker thread picked the attempt up — start the stall clock."""
+        with self._lock:
+            self._started = True
+            self._last_activity = time.monotonic()
+
+    @property
+    def bytes_downloaded(self) -> int:
+        """The most bytes seen in this attempt — for reporting, not detection."""
+        with self._lock:
+            return self._peak
+
+    def note_bytes(self, downloaded: int) -> None:
+        """Record a byte count from a progress event.
+
+        Any CHANGE is progress; only a repeat of the exact same number is not.
+
+        The distinction matters both ways:
+
+        * A repeated identical count is what a retrying fragment reports. If
+          that counted as movement, a wedged download would look permanently
+          healthy and the watchdog would never fire.
+        * A count that goes DOWN is a NEW FILE starting, not a stall.
+          `downloaded_bytes` is per-file, and two routine cases restart it at
+          zero inside a single attempt: a DASH pull downloads the video
+          stream and then begins the audio stream from 0, and each rung of
+          FORMAT_FALLBACK_CHAIN restarts from 0 in the same `_download` call.
+          Requiring the count to GROW would freeze the clock for the whole of
+          the second file and kill a healthy download as "stalled".
+        """
+        if not isinstance(downloaded, int) or downloaded <= 0:
+            return
+        with self._lock:
+            if downloaded != self._bytes:
+                self._bytes = downloaded
+                self._peak = max(self._peak, downloaded)
+                self._last_activity = time.monotonic()
+
+    def note_disk(self, footprint: int) -> None:
+        """Record the attempt's on-disk footprint; any CHANGE is progress.
+
+        The second, hook-independent progress signal. Not every stage of a
+        download reports through progress hooks: yt-dlp's `FFmpegFD`
+        (non-native HLS, protocol `m3u8`) emits exactly one hook — `finished`,
+        at the very end — and the local audio extract and the bestaudio
+        re-download that run after the video lands have none at all. All of
+        them write files under the attempt's stem, so bytes landing on disk
+        are the ground truth. The first sample only sets the baseline.
+        """
+        with self._lock:
+            if self._disk is not None and footprint != self._disk:
+                self._last_activity = time.monotonic()
+            self._disk = footprint
+
+    def note_event(self) -> None:
+        """Record non-byte activity (a status transition, a finished file)."""
+        with self._lock:
+            self._last_activity = time.monotonic()
+
+    def enter_postprocessing(self) -> None:
+        with self._lock:
+            self._postprocessing = True
+            self._last_activity = time.monotonic()
+
+    def exit_postprocessing(self) -> None:
+        """A postprocessor finished — that is real activity, so bump the clock."""
+        with self._lock:
+            self._postprocessing = False
+            self._last_activity = time.monotonic()
+
+    def clear_postprocessing(self) -> None:
+        """Un-stick the suspension WITHOUT counting as activity.
+
+        Called on every `downloading` event: bytes flowing means we are past
+        postprocessing, and a postprocessor that started and then errored (a
+        common reason to fall through to the next format rung) would
+        otherwise leave the flag pinned and every later rung unwatched.
+
+        Deliberately does NOT touch `_last_activity`: yt-dlp fires
+        `downloading` hooks during retries without necessarily moving a
+        byte, and only `note_bytes` decides whether that was progress.
+        """
+        with self._lock:
+            self._postprocessing = False
+
+    def idle_seconds(self) -> float | None:
+        """Seconds since the last sign of life, or None while not measurable
+        (still queued for a worker, or a postprocessor is running)."""
+        with self._lock:
+            if self._postprocessing or not self._started:
+                return None
+            return time.monotonic() - self._last_activity
+
+
+def _make_postprocessor_hook(tracker: "_DownloadProgress"):
+    """yt-dlp postprocessor hook that suspends the stall watchdog.
+
+    Fires around each postprocessor (Merger, FFmpegExtractAudio, embedders):
+    `started` then `finished`, run sequentially rather than nested, so a
+    plain boolean is enough. If a postprocessor starts and never reports
+    finishing, only the hard wall clock applies — the same bound as before
+    this watchdog existed. Never raises.
+    """
+    def _hook(d):
+        try:
+            status = (d or {}).get("status")
+            if status in ("started", "processing"):
+                tracker.enter_postprocessing()
+            elif status == "finished":
+                tracker.exit_postprocessing()
+            else:
+                # Unknown status from a future yt-dlp: a sign of life, but it
+                # must never be able to pin the watchdog off.
+                tracker.note_event()
+        except Exception:  # noqa: BLE001
+            pass
+    return _hook
+
+
+def _make_progress_hook(tracker: "_DownloadProgress"):
+    """yt-dlp progress hook that feeds the stall tracker. Never raises."""
+    def _hook(d):
+        try:
+            d = d or {}
+            if d.get("status") == "downloading":
+                tracker.clear_postprocessing()
+                tracker.note_bytes(d.get("downloaded_bytes") or 0)
+            else:
+                # 'finished' / 'error' are still signs of life.
+                tracker.note_event()
+        except Exception:  # noqa: BLE001
+            pass
+    return _hook
+
+
+async def _await_with_stall_guard(
+    awaitable,
+    tracker: "_DownloadProgress",
+    *,
+    hard_timeout: float,
+    stall_timeout: float,
+    url: str,
+    label: str = "Download",
+    footprint=None,
+):
+    """Await a download, failing early if it stops moving bytes.
+
+    `footprint`, when given, is a zero-arg callable returning the attempt's
+    bytes on disk (see `_stem_footprint`), sampled every `_DISK_POLL_S`; any
+    change counts as progress.
+
+    Two independent bounds:
+      * `stall_timeout` — no progress for this long (suspended while a
+        postprocessor runs). Raises DownloadStalledError.
+      * `hard_timeout` — total wall clock, regardless of progress. Raises
+        DownloadTimeoutError.
+
+    Cancelling the task does NOT kill the worker thread — Python cannot.
+    The download pool logs the abandonment and keeps the slot accounted for
+    until yt-dlp really returns (see backend/core/executors.py). What this
+    buys is that the JOB fails honestly and promptly, and that the stuck
+    thread can only ever hold a download worker, never the request path's.
+    """
+    task = asyncio.ensure_future(awaitable)
+    deadline = _now() + hard_timeout
+    next_disk_poll = 0.0
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_STALL_POLL_S)
+            if done:
+                try:
+                    return task.result()
+                except PoolExhaustedError as e:
+                    # Not a DownloadError, so the callers' error handling would
+                    # not recognise it and the raw RuntimeError text would land
+                    # verbatim in the job's error message.
+                    raise DownloadError(str(e)) from e
+
+            if _now() >= deadline:
+                raise DownloadTimeoutError(
+                    f"{label} timed out after {hard_timeout / 60:.0f} minutes. "
+                    f"The video may be too large or the connection too slow."
+                )
+
+            if footprint is not None and time.monotonic() >= next_disk_poll:
+                next_disk_poll = time.monotonic() + _DISK_POLL_S
+                try:
+                    # Off the loop: a glob over a large videos directory is a
+                    # real directory scan, and it always returns, so the
+                    # default executor is the right place for it.
+                    tracker.note_disk(int(await asyncio.to_thread(footprint)))
+                except Exception:  # noqa: BLE001 — a probe must never fail the download
+                    pass
+
+            idle = tracker.idle_seconds()
+            if idle is not None and idle >= stall_timeout:
+                got_mb = tracker.bytes_downloaded / 1024 / 1024
+                idle_txt = (
+                    f"{idle / 60:.0f} minutes" if idle >= 120 else f"{idle:.0f} seconds"
+                )
+                logger.warning(
+                    "[DOWNLOAD_STALLED] idle=%.0fs received=%.1fMB url=%s",
+                    idle, got_mb, url[:80],
+                )
+                raise DownloadStalledError(
+                    f"Download stalled: no data for {idle_txt} "
+                    f"({got_mb:.1f} MB received). The source accepted the "
+                    f"connection but stopped sending — yt-dlp kept retrying "
+                    f"without receiving bytes. This is usually the host "
+                    f"throttling or refusing the transfer; trying again, or a "
+                    f"different source URL, normally clears it."
+                )
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 async def download_video(
     url: str,
     output_dir: Path = None,
     filename: str = None,
     extract_audio: bool = True,
+    options: dict | None = None,
 ) -> dict:
     """
     Download a video using yt-dlp.
     Returns: {"video_path": Path, "audio_path": Path|None, "duration": int, "file_size_mb": float,
-              "subtitles": list|None, "chapters": list|None, "tags": list|None, "category": str|None}
+              "subtitles": list|None, "chapters": list|None, "tags": list|None, "category": str|None,
+              "height": int|None, "requested_quality": str|None, "kept_subtitle_paths": list,
+              "option_postprocessors_dropped": bool}
     Raises: RateLimitError, VideoUnavailableError, DownloadError
+
+    `options`: per-download yt-dlp options from
+    `backend.services.download_options` (quality / subtitles / container /
+    thumbnail / metadata). **None or {} means the pre-existing default path,
+    byte-identical to before this parameter existed** — the module-level
+    FORMAT_FALLBACK_CHAIN, the standard sidecar-subtitle sweep, no
+    postprocessors. Options are strictly additive; see that module for why a
+    quality cap degrades instead of failing.
+
+    `height` in the return is the resolution actually delivered, which is NOT
+    always the one requested (a cap falls through to the uncapped rungs rather
+    than erroring). Surfacing it is what lets a UI say "you asked for 4K, this
+    source only had 1080p" instead of implying the cap was honoured.
     """
     if output_dir is None:
         output_dir = settings.VIDEOS_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
     file_stem = filename or ""
+
+    # Per-download options. Normalized ONCE here so every branch below (base
+    # opts, the format ladder, the subtitle sweep) reads the same cleaned
+    # dict, and so a malformed dict from an LLM degrades to {} = default path
+    # rather than raising mid-download.
+    from backend.services import download_options as _dlopts
+    _opts = _dlopts.normalize(options)
+    _opt_overrides = _dlopts.ydl_overrides(_opts)
+    _opt_postprocessors = _opt_overrides.pop("_vm_postprocessors", [])
+    _format_chain = _dlopts.format_chain(_opts) or FORMAT_FALLBACK_CHAIN
+
+    # Byte-level progress, written by the hooks on the worker thread and read
+    # by the stall guard on the loop. This is what makes "0 MB for 20 minutes"
+    # a detectable state rather than an invisible one.
+    _progress = _DownloadProgress()
+    _progress_hook = _make_progress_hook(_progress)
+    _pp_hook = _make_postprocessor_hook(_progress)
 
     # Wait out any active rate-limit cooldown before starting
     cooldown = _check_cooldown()
@@ -454,6 +977,23 @@ async def download_video(
         await asyncio.sleep(cooldown)
 
     def _download():
+        """Run one download, sweeping part-files on EVERY exit path.
+
+        The per-attempt handlers in `_download_inner` clean up on most error
+        paths, but an unclassified exception (a bug, an OSError from a full
+        disk) bypasses them all. The `finally` here runs regardless and is
+        itself guarded, so a cleanup failure can never mask the original
+        exception.
+        """
+        try:
+            return _download_inner()
+        finally:
+            try:
+                _cleanup_partial_files(output_dir, file_stem)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Final-stage partial-file cleanup failed (non-fatal): %s", e)
+
+    def _download_inner():
         import yt_dlp
 
         video_path = None
@@ -481,10 +1021,29 @@ async def download_video(
             "writeautomaticsub": True,
             "subtitleslangs": ["en", "zh", "ja", "ko", "es", "fr", "de", "pt", "ru", "ar"],
             "subtitlesformat": "srt/vtt/best",
+            # Feed the stall watchdog. The postprocessor hook SUSPENDS it
+            # while an ffmpeg merge runs — a merge of a long file reports no
+            # download progress for minutes, and the watchdog must never kill
+            # a download that has already fully arrived.
+            "progress_hooks": [_progress_hook],
+            "postprocessor_hooks": [_pp_hook],
         }
 
         # Use cached browser cookies (avoids repeated Keychain prompts on macOS)
         _apply_cookies(base_opts)
+
+        # Per-download options LAST so an explicit request wins over the
+        # standard layer (e.g. narrowing subtitleslangs from the 10-language
+        # transcript sweep to the one language the user asked to embed).
+        # Postprocessors are APPENDED, never assigned — so a future caller
+        # that installs its own on this dict keeps them.
+        if _opt_overrides:
+            base_opts.update(_opt_overrides)
+        if _opt_postprocessors:
+            base_opts["postprocessors"] = [
+                *(base_opts.get("postprocessors") or []),
+                *_opt_postprocessors,
+            ]
 
         def _attempt_download(opts):
             """Single download attempt — raises on failure."""
@@ -509,8 +1068,17 @@ async def download_video(
 
         # ── Main download with multi-layer retry ────────────────────────────
         last_error = None
+        # Whether the per-download optional postprocessors (embed thumbnail /
+        # subtitles / metadata from `options`) were dropped after a
+        # postprocessing failure. Lives OUTSIDE the format loop: once an extra
+        # proved un-embeddable for this source, re-attaching it on the next
+        # format rung would just fail the same way.
+        opt_pps_dropped = False
 
-        for fmt_idx, fmt in enumerate(FORMAT_FALLBACK_CHAIN):
+        # `_format_chain` is FORMAT_FALLBACK_CHAIN unless the caller asked for
+        # a specific quality — see download_options.format_chain() on why an
+        # unrequested download must keep the module-level chain verbatim.
+        for fmt_idx, fmt in enumerate(_format_chain):
             video_opts = {**base_opts, "format": fmt}
 
             # Up to 2 attempts per format (original + 1 retry for transient errors)
@@ -550,6 +1118,24 @@ async def download_video(
                             f"Try again in a few minutes. (Error: {e})"
                         )
 
+                    # ── HTTP 403 with cookies applied: retry WITHOUT them ────
+                    # A 403 is often caused BY the cookie jar (see
+                    # _drop_cookies_for_403). Retrying the same configuration
+                    # can only fail the same way, so drop the jar once and try
+                    # again — including across the format fallbacks, hence the
+                    # mirror onto base_opts, which every later format is
+                    # rebuilt from.
+                    if ("http error 403" in error_str or "403: forbidden" in error_str) \
+                            and _drop_cookies_for_403(video_opts):
+                        for _ck in ("cookiefile", "cookiesfrombrowser"):
+                            base_opts.pop(_ck, None)
+                        logger.warning(
+                            "HTTP 403 with cookies applied — retrying without them "
+                            "(re-enables the token-free player clients)"
+                        )
+                        _cleanup_partial_files(output_dir, file_stem)
+                        continue
+
                     # ── Bot detection: retry with fresh cookies ────
                     if _is_bot_detection_error(str(e)) and attempt == 0:
                         browser = _detect_cookie_browser()
@@ -580,6 +1166,37 @@ async def download_video(
                         logger.warning(f"Format '{fmt}' failed, trying next fallback: {e}")
                         _cleanup_partial_files(output_dir, file_stem)
                         break  # Break retry loop, try next format
+
+                    # ── Optional-postprocessor failure: drop extras, keep video ──
+                    # Postprocessor errors fire AFTER the video is fully on
+                    # disk — failing the download over cover art would break
+                    # the options contract (degrade, never fail; see
+                    # download_options). Known offender: EmbedThumbnail
+                    # hard-raises on webm (single-stream downloads dodge the
+                    # merge_output_format steer). Drop OUR appended
+                    # postprocessors and retry the same format — yt-dlp sees
+                    # the finished file and skips straight to postprocessing,
+                    # so the retry costs no bandwidth. Runs AFTER the
+                    # format/merge predicate on purpose: yt-dlp's merger is
+                    # also a postprocessor, and a merge failure must keep its
+                    # walk down the format chain.
+                    if (_opt_postprocessors and not opt_pps_dropped
+                            and "postprocessing" in error_str):
+                        opt_pps_dropped = True
+                        remaining = [pp for pp in (base_opts.get("postprocessors") or [])
+                                     if pp not in _opt_postprocessors]
+                        # base_opts too: video_opts is rebuilt from it on the
+                        # next format rung, which would resurrect the extras.
+                        base_opts["postprocessors"] = remaining
+                        video_opts["postprocessors"] = remaining
+                        # Sweep the failed postprocessor's `<stem>.temp.*`
+                        # leftovers; the patterns never match the finished
+                        # video, which the retry deliberately reuses.
+                        _cleanup_partial_files(output_dir, file_stem)
+                        logger.warning(
+                            "Optional postprocessor failed, retrying without embed extras: %s", e
+                        )
+                        continue  # Retry same format without the extras
 
                     # ── Unknown error on first attempt: retry once ────
                     if attempt == 0:
@@ -612,8 +1229,20 @@ async def download_video(
         # Extract subtitles from downloaded files
         subtitles = _collect_subtitles(output_dir, file_stem_resolved)
 
-        # Clean up subtitle files after parsing (they're stored in DB now)
-        _cleanup_subtitle_files(output_dir, file_stem_resolved)
+        # Clean up subtitle files after parsing (they're stored in DB now).
+        #
+        # EXCEPT when the caller asked for `subtitles: "file"` — then the
+        # sidecar .srt IS the deliverable and sweeping it away would make the
+        # option a silent no-op. "embed" still sweeps: the track is inside the
+        # container by then, so leaving loose files would be litter.
+        kept_subtitle_paths: list[str] = []
+        if _opts.get("subtitles") == "file":
+            for _ext in ("srt", "vtt"):
+                kept_subtitle_paths.extend(
+                    str(p) for p in output_dir.glob(f"{file_stem_resolved}.*.{_ext}")
+                )
+        else:
+            _cleanup_subtitle_files(output_dir, file_stem_resolved)
 
         # Extract chapters from metadata
         chapters = _extract_chapters(info)
@@ -671,12 +1300,48 @@ async def download_video(
             "chapters": chapters,
             "tags": tags,
             "category": category,
+            # What the user actually GOT vs what they asked for. A quality cap
+            # degrades to the uncapped rungs rather than failing, so these two
+            # can legitimately disagree — the UI reports the difference instead
+            # of implying the request was honoured.
+            "height": info.get("height"),
+            "requested_quality": _opts.get("quality"),
+            "kept_subtitle_paths": kept_subtitle_paths,
+            # True when a postprocessing failure forced the embed extras
+            # (thumbnail / subtitles / metadata) to be dropped so the video
+            # itself could be kept — surfaced so the caller can report the
+            # degradation instead of implying the extras were applied.
+            "option_postprocessors_dropped": opt_pps_dropped,
         }
 
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_download), timeout=1200)  # 20 min max per video
-    except asyncio.TimeoutError:
-        raise DownloadError("Download timed out after 20 minutes. The video may be too large or the connection too slow.")
+    def _footprint() -> int:
+        # The video stem in the videos dir, plus the audio the attempt
+        # extracts after it lands (`<stem>_audio.mp3`) — both stages of one
+        # attempt write only under this stem.
+        return _stem_footprint(
+            (output_dir, file_stem),
+            (settings.AUDIO_DIR, file_stem),
+        )
+
+    # The stall clock starts when the pool ADMITS the call (`on_admit`), not
+    # while it queues for a free worker — a queued download cannot move a
+    # byte, and admission waits are longest exactly when workers are held by
+    # earlier stalls.
+    #
+    # A DownloadStalledError / DownloadTimeoutError out of here is TERMINAL
+    # for the caller: we stopped awaiting a thread Python cannot stop. That
+    # thread is still inside `_download`, and its `finally` will eventually
+    # delete `<stem>*.part` — so a second attempt into the same output stem
+    # would have its part-files deleted out from under it. Recovering needs a
+    # different output stem, not a retry.
+    _progress.reset(queued=True)
+    return await _await_with_stall_guard(
+        download_pool.run(_download, on_admit=_progress.mark_started), _progress,
+        hard_timeout=VIDEO_HARD_TIMEOUT_S,
+        stall_timeout=settings.DOWNLOAD_STALL_TIMEOUT_S,
+        url=url,
+        footprint=_footprint,
+    )
 
 
 def _collect_subtitles(output_dir: Path, video_id: str) -> list[dict] | None:
@@ -816,6 +1481,211 @@ def _extract_chapters(info: dict) -> list[dict] | None:
     ]
 
 
+# ── Subtitles only (no video, no audio) ─────────────────────────────────────
+
+# The fallback chain for "whatever this video has". The caller's language (or
+# the video's own spoken language, when it declares one) goes in front.
+_DEFAULT_SUBTITLE_LANGS: tuple[str, ...] = (
+    "en", "zh", "ja", "ko", "es", "fr", "de", "pt", "ru", "ar",
+)
+
+# Subtitle files are tiny; a healthy fetch finishes in seconds. This bounds a
+# wedged extraction. A timed-out call cannot be cancelled (it keeps its worker
+# until yt-dlp returns), which is why it runs on `download_pool` and never on
+# the shared default executor.
+SUBTITLE_FETCH_TIMEOUT_S = 300
+
+
+def _subtitle_lang_chain(language: str | None, video_language: str | None) -> list[str]:
+    """Preference order for the caption track.
+
+    A caller-pinned language wins. With none, the video's OWN language comes
+    first: YouTube publishes an auto-translated track in ~150 languages next to
+    the original, so without this a Spanish talk resolved to the machine
+    translation into English simply because "en" heads the default chain.
+    """
+    lead = (language or "").strip().lower() or (video_language or "").strip().lower()
+    lead = lead.split("-")[0] if lead else ""
+    chain = [lead] if lead else []
+    return chain + [lang for lang in _DEFAULT_SUBTITLE_LANGS if lang != lead]
+
+
+def _pick_subtitle_track(
+    manual: dict, auto: dict, langs: list[str], prefer_manual: bool = True,
+) -> tuple[str, str, bool] | None:
+    """Choose `(track_key, base_language, is_auto)` from yt-dlp's track maps.
+
+    Per language, in caller order: a creator track first (exact key, then a
+    regional variant such as `en-US` / `es-419`), then the auto-generated one
+    (exact key, then YouTube's `<lang>-orig` original-language ASR track).
+    Returns None when nothing in the chain exists in either map.
+    """
+    def _manual_key(lang: str) -> str | None:
+        if lang in manual:
+            return lang
+        return next((k for k in sorted(manual)
+                     if k.lower().startswith(f"{lang}-") and not k.endswith("-orig")), None)
+
+    def _auto_key(lang: str) -> str | None:
+        for key in (lang, f"{lang}-orig"):
+            if key in auto:
+                return key
+        return None
+
+    for lang in langs:
+        m, a = _manual_key(lang), _auto_key(lang)
+        if prefer_manual and m:
+            return m, lang, False
+        if a:
+            return a, lang, True
+        if m:
+            return m, lang, False
+    return None
+
+
+async def extract_subtitles_only(
+    url: str,
+    output_dir: Path,
+    language: str | None = None,
+    prefer_manual: bool = True,
+) -> dict:
+    """Download just the caption track for a URL — no video, no audio bytes.
+
+    Two yt-dlp passes: a metadata probe (so the language is picked
+    deterministically and a source with no captions fails with a clear
+    message instead of writing nothing), then a subtitles-only fetch into
+    `output_dir`. Both run on `download_pool`.
+
+    Args:
+        url: A single-video URL on any site yt-dlp supports.
+        output_dir: Where the subtitle file is written. The caller owns it.
+        language: Optional 2-letter ISO code. The caller's code is tried first,
+            then the default chain — so the track returned may be in another
+            language; compare `language` in the result if that matters.
+        prefer_manual: Creator-uploaded captions beat auto-generated ones.
+
+    Returns:
+        {"path", "language" (base 2-letter code), "track" (yt-dlp's key),
+         "format" ("srt" | "vtt"), "is_auto_generated", "title", "duration"}
+
+    Raises:
+        NoCaptionsError: no caption track in any candidate language, or the
+            chosen track could not be written as .srt / .vtt.
+        VideoUnavailableError: the URL did not resolve to a single video.
+        DownloadTimeoutError: the fetch exceeded SUBTITLE_FETCH_TIMEOUT_S.
+        DownloadError: any other yt-dlp failure, after one retry.
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("url is required")
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _base_opts(**extra) -> dict:
+        opts = {
+            **_yt_dlp_base_opts(), **_yt_dlp_js_opts(),
+            "skip_download": True,
+            "noplaylist": True,
+            "http_headers": _yt_dlp_http_headers(),
+            **extra,
+        }
+        _apply_cookies(opts)
+        return opts
+
+    def _do_extract(drop_cookies: bool) -> dict:
+        import yt_dlp
+
+        probe_opts = _base_opts(socket_timeout=15)
+        if drop_cookies:
+            _drop_cookies_for_403(probe_opts)
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            raise VideoUnavailableError("yt-dlp could not resolve the URL.")
+        if info.get("entries") is not None or info.get("_type") == "playlist":
+            raise VideoUnavailableError(
+                "This link is a playlist or channel — paste the link to a single video."
+            )
+
+        manual = info.get("subtitles") or {}
+        auto = info.get("automatic_captions") or {}
+        langs = _subtitle_lang_chain(language, info.get("language"))
+        picked = _pick_subtitle_track(manual, auto, langs, prefer_manual=prefer_manual)
+        if not picked:
+            available = sorted(set(manual) | {k for k in auto if k.endswith("-orig")})
+            tried = ", ".join(langs[:3]) + (f" and {len(langs) - 3} more" if len(langs) > 3 else "")
+            raise NoCaptionsError(
+                f"This video has no caption track (tried {tried}). "
+                f"Source offers: {', '.join(available[:12]) if available else 'none'}."
+            )
+        track, base_lang, is_auto = picked
+
+        # Stem keyed off the video id so two jobs never share a file name; the
+        # directory is per-job anyway.
+        stem = f"subs_{re.sub(r'[^A-Za-z0-9_-]', '_', str(info.get('id') or 'video'))}"
+        fetch_opts = _base_opts(
+            socket_timeout=30,
+            writesubtitles=not is_auto,
+            writeautomaticsub=is_auto,
+            subtitleslangs=[track],
+            subtitlesformat="srt/vtt/best",
+            outtmpl=str(output_dir / stem) + ".%(ext)s",
+        )
+        if drop_cookies:
+            _drop_cookies_for_403(fetch_opts)
+        with yt_dlp.YoutubeDL(fetch_opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        for ext in ("srt", "vtt"):
+            candidate = output_dir / f"{stem}.{track}.{ext}"
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return {
+                    "path": str(candidate),
+                    "language": base_lang,
+                    "track": track,
+                    "format": ext,
+                    "is_auto_generated": is_auto,
+                    "title": info.get("title") or "",
+                    "duration": info.get("duration"),
+                }
+        raise NoCaptionsError(
+            f"The '{track}' caption track exists but could not be fetched as .srt or .vtt."
+        )
+
+    import yt_dlp as _yt_dlp_mod
+
+    drop_cookies = False
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(
+                download_pool.run(_do_extract, drop_cookies),
+                timeout=SUBTITLE_FETCH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            # Terminal: the worker is still inside yt-dlp, so a retry would
+            # race it. Say what happened instead.
+            raise DownloadTimeoutError(
+                f"Caption fetch timed out after {SUBTITLE_FETCH_TIMEOUT_S // 60} minutes."
+            )
+        except PoolExhaustedError as e:
+            raise DownloadError(str(e)) from e
+        except VideoUnavailableError:
+            raise  # no captions / not a video — retrying cannot change it
+        except _yt_dlp_mod.utils.DownloadError as e:
+            error_str = str(e).lower()
+            if attempt == 0 and ("http error 403" in error_str or "403: forbidden" in error_str):
+                # A cookie jar hides yt-dlp's token-free player clients on
+                # YouTube (see _drop_cookies_for_403) — retry once without it.
+                logger.warning("Caption fetch got a 403 — retrying once without cookies")
+                drop_cookies = True
+                continue
+            if attempt == 0 and _is_transient_error(error_str):
+                logger.warning("Caption fetch hit a transient error — retrying once: %s", e)
+                await asyncio.sleep(3)
+                continue
+            raise DownloadError(str(e).replace("ERROR: ", "", 1)) from e
+    raise DownloadError("Caption fetch failed.")  # unreachable
+
+
 async def get_video_info(url: str, flat: bool = False) -> dict:
     """Get video/channel metadata without downloading.
     Use flat=True for channels/playlists to avoid resolving every video."""
@@ -828,7 +1698,9 @@ async def get_video_info(url: str, flat: bool = False) -> dict:
             return ydl.extract_info(url, download=False)
 
     try:
-        return await asyncio.to_thread(_info)
+        # yt-dlp can fail to return, so it never runs on the shared default
+        # executor (see backend/core/executors.py).
+        return await download_pool.run(_info)
     except Exception as e:
         logger.error(f"Failed to get video info: {e}")
         return {}
@@ -888,7 +1760,7 @@ async def list_channel_videos(url: str, max_videos: int = 5) -> list[dict]:
         return results
 
     try:
-        return await asyncio.to_thread(_list)
+        return await download_pool.run(_list)
     except Exception as e:
         logger.error(f"Failed to list channel videos: {e}")
         return []

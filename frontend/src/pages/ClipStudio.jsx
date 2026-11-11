@@ -1,11 +1,15 @@
-import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useMemo, useRef, memo } from "react"
 import {
   Box, Typography, Paper, Stack, Chip, IconButton, Button, Divider,
-  TextField, Tooltip, CircularProgress, Slider, Menu, MenuItem,
-  ListItemText, ListItemIcon, Skeleton, Badge, alpha, FormControlLabel, Checkbox,
-  Dialog, DialogTitle, DialogContent, DialogActions,
+  TextField, Tooltip, CircularProgress, Menu, MenuItem,
+  ListItemText, ListItemIcon, Skeleton, Badge, alpha,
+  Dialog, DialogContent,
+  LinearProgress, ToggleButton, ToggleButtonGroup,
 } from "@mui/material"
 import ContentCutIcon from "@mui/icons-material/ContentCut"
+import AutoFixHighIcon from "@mui/icons-material/AutoFixHighOutlined"
+import MovieFilterOutlinedIcon from "@mui/icons-material/MovieFilterOutlined"
+import SlideshowOutlinedIcon from "@mui/icons-material/SlideshowOutlined"
 import WhatshotIcon from "@mui/icons-material/Whatshot"
 import AccessTimeIcon from "@mui/icons-material/AccessTime"
 import PlayCircleOutlineIcon from "@mui/icons-material/PlayCircleOutline"
@@ -25,36 +29,128 @@ import CloseIcon from "@mui/icons-material/Close"
 import CheckCircleIcon from "@mui/icons-material/CheckCircle"
 import VideocamIcon from "@mui/icons-material/Videocam"
 import FolderOpenIcon from "@mui/icons-material/FolderOpen"
+import AddIcon from "@mui/icons-material/Add"
 import http from "../api/http"
 import useAppStore from "../store/appStore"
 import ActiveJobsBanner from "../components/create/ActiveJobsBanner"
+import ExtractDialog from "../components/clip/ExtractDialog"
+import SourceBench from "../components/clip/bench/SourceBench"
+import useClipSettings from "../components/clip/useClipSettings"
+import useBenchRanges, { MIN_LEN_SEC } from "../components/clip/bench/useBenchRanges"
+import {
+  formatTime, hookTypeLabel, viralityColor, viralityLabel, clipAspectCss,
+} from "../components/clip/clipFormat"
 
-/* ── Helpers ───────────────────────────────────────────────── */
-
-function formatTime(seconds) {
-  if (seconds == null) return "--:--"
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  return `${m}:${String(s).padStart(2, "0")}`
+// clip_score_breakdown_json arrives as a JSON string ({flow, value, trend,
+// shareability} each 1-10). Parse defensively — a legacy clip has no field,
+// a malformed one shouldn't throw. Returns the parsed object or null so the
+// scoreboard hides itself when there's nothing to show.
+function parseScoreBreakdown(clip) {
+  const raw = clip?.clip_score_breakdown_json
+  if (!raw) return null
+  if (typeof raw === "object") return raw
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === "object" ? parsed : null
+  } catch {
+    return null
+  }
 }
 
-function viralityColor(score) {
-  if (score >= 8) return "success"
-  if (score >= 6) return "warning"
-  return "default"
+/* ── Score breakdown scoreboard ─────────────────────────────── */
+
+const SCORE_FACTOR_META = {
+  hook:         { label: "Hook",  blurb: "Does the opening 2-3 seconds stop the scroll? Scored on the first sentence only." },
+  flow:         { label: "Flow",  blurb: "Logical narrative arc with a satisfying close — no dangling thoughts." },
+  value:        { label: "Value", blurb: "Emotional or practical resonance — a payoff, actionable takeaway, or gut reaction." },
+  trend:        { label: "Trend", blurb: "Alignment with what audiences are clicking on right now in this niche." },
+  shareability: { label: "Share", blurb: "Would a viewer quote this, screenshot it, or send it to a friend?" },
 }
 
-function viralityLabel(score) {
-  if (score >= 9) return "Viral"
-  if (score >= 8) return "Strong"
-  if (score >= 6) return "Good"
-  if (score >= 4) return "Average"
-  return "Low"
+function scoreFactorColor(score) {
+  if (score == null) return "text.disabled"
+  if (score >= 8) return "success.main"
+  if (score >= 6) return "warning.main"
+  return "text.disabled"
+}
+
+function ScoreBar({ factor, score }) {
+  const meta = SCORE_FACTOR_META[factor]
+  if (!meta) return null
+  const pct = score == null ? 0 : Math.max(0, Math.min(score, 10)) * 10
+  const color = scoreFactorColor(score)
+  return (
+    <Tooltip title={meta.blurb} arrow placement="top">
+      <Box sx={{ cursor: "default" }}>
+        <Stack direction="row" justifyContent="space-between" sx={{ mb: 0.25 }}>
+          <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>{meta.label}</Typography>
+          <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.7rem", color }}>
+            {score == null ? "—" : score.toFixed(1)}
+          </Typography>
+        </Stack>
+        <LinearProgress
+          variant="determinate"
+          value={pct}
+          sx={{
+            height: 5, borderRadius: 3,
+            bgcolor: (t) => t.palette.mode === "dark" ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)",
+            "& .MuiLinearProgress-bar": { bgcolor: color, borderRadius: 3 },
+          }}
+        />
+      </Box>
+    </Tooltip>
+  )
+}
+
+// 5-factor virality scoreboard (Hook / Flow / Value / Trend / Share) shown in
+// the clip detail panel. Renders nothing on legacy clips that have neither a
+// hook score nor a parsed breakdown — keeps the panel backward-compatible.
+function ScoreBreakdownPanel({ clip }) {
+  if (!clip) return null
+  const hook = clip.clip_hook_score
+  const breakdown = parseScoreBreakdown(clip)
+  if (hook == null && !breakdown) return null
+
+  const factors = [
+    { key: "hook", score: hook },
+    { key: "flow", score: breakdown?.flow },
+    { key: "value", score: breakdown?.value },
+    { key: "trend", score: breakdown?.trend },
+    { key: "shareability", score: breakdown?.shareability },
+  ]
+
+  return (
+    <Paper variant="outlined" sx={{ p: 2, borderRadius: 2 }}>
+      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1.5 }}>
+        <WhatshotIcon sx={{ fontSize: 16, color: "primary.main" }} />
+        <Typography variant="overline" sx={{ color: "text.secondary", fontWeight: 700, fontSize: "0.65rem" }}>
+          Virality scoreboard
+        </Typography>
+        {clip.clip_virality_score != null && (
+          <>
+            <Box sx={{ flex: 1 }} />
+            <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.7rem" }}>
+              Overall: <strong>{clip.clip_virality_score.toFixed(1)}</strong>/10
+            </Typography>
+          </>
+        )}
+      </Stack>
+      <Box sx={{
+        display: "grid",
+        gridTemplateColumns: { xs: "repeat(2, 1fr)", sm: "repeat(3, 1fr)", md: "repeat(5, 1fr)" },
+        gap: 1.5,
+      }}>
+        {factors.map(({ key, score }) => (
+          <ScoreBar key={key} factor={key} score={score} />
+        ))}
+      </Box>
+    </Paper>
+  )
 }
 
 /* ── Source Video Sidebar Item ──────────────────────────────── */
 
-function SourceVideoCard({ video, clipCount, isSelected, onClick }) {
+function SourceVideoCard({ video, clipCount, isSelected, onClick, onPreview }) {
   return (
     <Paper
       elevation={0}
@@ -75,13 +171,17 @@ function SourceVideoCard({ video, clipCount, isSelected, onClick }) {
       {/* Thumbnail */}
       <Box sx={{
         width: "100%", aspectRatio: "16/9", borderRadius: 2, overflow: "hidden",
-        bgcolor: "action.hover", mb: 1, position: "relative",
+        // Black, because the image is CONTAINed below rather than cropped: a
+        // portrait source was centre-cropped to a letterbox strip in the one
+        // place you pick between sources.
+        bgcolor: "#000", mb: 1, position: "relative",
       }}>
-        {(video.thumbnail_path || video.thumbnail_url) ? (
+        {(video.video_path || video.thumbnail_url) ? (
           <Box component="img"
-            src={video.thumbnail_path ? `/api/downloaded/${video.id}/thumbnail` : video.thumbnail_url}
+            src={video.video_path ? `/api/downloaded/${video.id}/thumbnail` : video.thumbnail_url}
             alt=""
-            sx={{ width: "100%", height: "100%", objectFit: "cover" }}
+            loading="lazy" decoding="async"
+            sx={{ width: "100%", height: "100%", objectFit: "contain" }}
             onError={e => { e.target.style.display = "none" }} />
         ) : (
           <Box sx={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -101,6 +201,23 @@ function SourceVideoCard({ video, clipCount, isSelected, onClick }) {
             }}
           />
         )}
+        {/* Preview button — stopPropagation so it doesn't also select the card.
+            Only for locally-downloaded (streamable) sources. */}
+        {onPreview && video.video_path && (
+          <Tooltip title="Preview video">
+            <IconButton
+              size="small"
+              onClick={(e) => { e.stopPropagation(); onPreview(video) }}
+              sx={{
+                position: "absolute", top: 4, right: 4,
+                bgcolor: "rgba(0,0,0,0.6)", color: "#fff",
+                "&:hover": { bgcolor: "rgba(0,0,0,0.8)" }, p: 0.5,
+              }}
+            >
+              <PlayCircleOutlineIcon sx={{ fontSize: 20 }} />
+            </IconButton>
+          </Tooltip>
+        )}
       </Box>
 
       <Typography variant="body2" sx={{ fontWeight: 600, fontSize: "0.8rem", lineHeight: 1.3 }} noWrap>
@@ -118,12 +235,12 @@ function SourceVideoCard({ video, clipCount, isSelected, onClick }) {
 
 /* ── Clip Filmstrip Card ───────────────────────────────────── */
 
-function ClipCard({ clip, isSelected, onClick }) {
+function ClipCardImpl({ clip, isSelected, onSelect }) {
   const score = clip.clip_virality_score
   return (
     <Paper
       elevation={0}
-      onClick={onClick}
+      onClick={() => onSelect(clip)}
       sx={{
         width: 140, minWidth: 140, flexShrink: 0,
         cursor: "pointer",
@@ -142,9 +259,14 @@ function ClipCard({ clip, isSelected, onClick }) {
       }}
     >
       {/* Thumbnail */}
-      <Box sx={{ width: "100%", aspectRatio: "9/16", position: "relative", bgcolor: "#000" }}>
+      {/* The frame follows the clip's probed aspect — extraction only reframes
+          when "vertical" is on, so a 16:9 cut is a real 16:9 file and a
+          hardcoded 9:16 centre-cropped it to a sliver. ?v= is the cache-bust
+          signal: without a new value a regenerated thumbnail never appears
+          (same URL, so the browser keeps the bytes it has). */}
+      <Box sx={{ width: "100%", aspectRatio: clipAspectCss(clip.aspect_ratio), position: "relative", bgcolor: "#000" }}>
         {clip.thumbnail_path ? (
-          <Box component="img" src={`/api/videos/${clip.id}/thumbnail`} alt=""
+          <Box component="img" src={`/api/videos/${clip.id}/thumbnail?v=${encodeURIComponent(clip.thumb_v || clip.created_at || "1")}`} alt=""
             sx={{ width: "100%", height: "100%", objectFit: "cover" }} />
         ) : (
           <Box sx={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -204,150 +326,16 @@ function ClipCard({ clip, isSelected, onClick }) {
   )
 }
 
-/* ── Extract Clips Dialog ──────────────────────────────────── */
-
-const WHISPER_QUALITIES = [
-  { value: "fast", label: "Fast (base)", desc: "~30s per 5min video" },
-  { value: "balanced", label: "Balanced (small)", desc: "~90s per 5min video" },
-  { value: "accurate", label: "Accurate (medium)", desc: "~3min per 5min video" },
-  { value: "best", label: "Best (large-v3)", desc: "~8min per 5min video" },
-]
-
-function ExtractDialog({ open, onClose, video, onExtract }) {
-  const hasSegments = !!video?.has_transcript_segments
-  const [opts, setOpts] = useState({ caption_style: "viral", min_duration: null, max_duration: null, whisper_quality: "balanced", retranscribe: false })
-
-  // Reset retranscribe when video changes
-  useEffect(() => { setOpts(p => ({ ...p, retranscribe: false })) }, [video?.id])
-
-  if (!video) return null
-
-  const transcribeEnabled = !hasSegments || opts.retranscribe
-  const durationError = opts.min_duration && opts.max_duration && opts.max_duration - opts.min_duration < 1
-  const canSubmit = !durationError
-
-  return (
-    <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
-      <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-        <ContentCutIcon color="primary" /> Extract Clips
-      </DialogTitle>
-      <DialogContent>
-        <Typography variant="body2" sx={{ color: "text.secondary", mb: 2 }}>
-          From: <strong>{video.title || "Untitled"}</strong> ({formatTime(video.duration_seconds)})
-        </Typography>
-        <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 2.5 }}>
-          AI will analyze the transcript and automatically find the best viral moments. The number of clips depends on how much quality content the video has.
-        </Typography>
-        <Stack spacing={2.5}>
-          {/* Transcription */}
-          <Box>
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={transcribeEnabled}
-                  onChange={e => setOpts(p => ({ ...p, retranscribe: e.target.checked }))}
-                  disabled={!hasSegments}
-                  size="small"
-                />
-              }
-              label={
-                <Typography variant="caption" sx={{ fontWeight: 600 }}>
-                  Transcription {hasSegments
-                    ? <Chip label="cached" size="small" color="success" variant="outlined" sx={{ ml: 0.5, height: 18, fontSize: "0.65rem" }} />
-                    : <Chip label="required" size="small" color="warning" variant="outlined" sx={{ ml: 0.5, height: 18, fontSize: "0.65rem" }} />
-                  }
-                </Typography>
-              }
-              sx={{ mb: 0.5 }}
-            />
-            {!hasSegments && (
-              <Typography variant="caption" sx={{ color: "text.secondary", display: "block", ml: 4, mb: 1 }}>
-                No word-level transcript found — Whisper will transcribe the audio first
-              </Typography>
-            )}
-            {hasSegments && !opts.retranscribe && (
-              <Typography variant="caption" sx={{ color: "success.main", display: "block", ml: 4, mb: 1 }}>
-                Using cached transcript — Whisper will be skipped
-              </Typography>
-            )}
-            {hasSegments && opts.retranscribe && (
-              <Typography variant="caption" sx={{ color: "warning.main", display: "block", ml: 4, mb: 1 }}>
-                Will re-transcribe with selected model (replaces cached transcript)
-              </Typography>
-            )}
-            <TextField select size="small" fullWidth
-              value={opts.whisper_quality}
-              onChange={e => setOpts(p => ({ ...p, whisper_quality: e.target.value }))}
-              disabled={!transcribeEnabled}
-              sx={{ ml: 0 }}
-            >
-              {WHISPER_QUALITIES.map(q => (
-                <MenuItem key={q.value} value={q.value}>
-                  <Stack direction="row" justifyContent="space-between" sx={{ width: "100%" }}>
-                    <Typography variant="body2">{q.label}</Typography>
-                    <Typography variant="caption" sx={{ color: "text.secondary", ml: 2 }}>{q.desc}</Typography>
-                  </Stack>
-                </MenuItem>
-              ))}
-            </TextField>
-          </Box>
-
-          {/* Caption style */}
-          <Box>
-            <Typography variant="caption" sx={{ fontWeight: 600, mb: 0.5, display: "block" }}>Caption style</Typography>
-            <Stack direction="row" spacing={1}>
-              {["viral", "classic", "bold", "none"].map(s => (
-                <Chip key={s} label={s} size="small"
-                  variant={opts.caption_style === s ? "filled" : "outlined"}
-                  color={opts.caption_style === s ? "primary" : "default"}
-                  onClick={() => setOpts(p => ({ ...p, caption_style: s }))}
-                  sx={{ textTransform: "capitalize", cursor: "pointer" }} />
-              ))}
-            </Stack>
-          </Box>
-
-          {/* Duration range */}
-          <Box>
-            <Typography variant="caption" sx={{ fontWeight: 600, mb: 0.5, display: "block" }}>
-              Clip duration range (leave empty for auto 15–60s)
-            </Typography>
-            <Stack direction="row" spacing={2} alignItems="center">
-              <TextField label="Min (s)" type="number" size="small" sx={{ width: 90 }}
-                value={opts.min_duration || ""}
-                error={!!durationError}
-                slotProps={{ htmlInput: { min: 10, max: 120 } }}
-                onChange={e => setOpts(p => ({ ...p, min_duration: parseInt(e.target.value) || null }))} />
-              <Typography variant="body2" sx={{ color: "text.secondary" }}>to</Typography>
-              <TextField label="Max (s)" type="number" size="small" sx={{ width: 90 }}
-                value={opts.max_duration || ""}
-                error={!!durationError}
-                slotProps={{ htmlInput: { min: 15, max: 180 } }}
-                onChange={e => setOpts(p => ({ ...p, max_duration: parseInt(e.target.value) || null }))} />
-            </Stack>
-            {durationError && (
-              <Typography variant="caption" sx={{ color: "error.main", mt: 0.5, display: "block" }}>
-                Max must be at least 1 second greater than Min
-              </Typography>
-            )}
-          </Box>
-        </Stack>
-      </DialogContent>
-      <DialogActions sx={{ px: 3, pb: 2 }}>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button variant="contained" startIcon={<ContentCutIcon />}
-          disabled={!canSubmit}
-          onClick={() => { onExtract(video.id, { ...opts, force_retranscribe: transcribeEnabled }); onClose() }}>
-          Extract Clips
-        </Button>
-      </DialogActions>
-    </Dialog>
-  )
-}
-
-
 /* ══════════════════════════════════════════════════════════════
    MAIN COMPONENT: Clip Studio
    ══════════════════════════════════════════════════════════════ */
+
+// Memoized: the page re-renders per pointermove while a bench handle drags,
+// and a filmstrip of these re-rendering per mouse event is the difference
+// between a smooth drag and a stutter. Props are primitives plus a stable
+// setter — a fresh `onClick` arrow per render would defeat the memo, which
+// is why the card takes `onSelect(clip)` instead.
+const ClipCard = memo(ClipCardImpl)
 
 export default function ClipStudio() {
   const showSnackbar = useAppStore((s) => s.showSnackbar)
@@ -359,15 +347,23 @@ export default function ClipStudio() {
     || (j.inputData && j.inputData.type === "clip_extraction")
   const clipJobs = Object.values(activeJobs).filter(isClipJob)
   const clipJobFilter = (j) => j.status === "running" && isClipJob(j)
+  // Both Cut buttons disable while a cut is in flight. A suggestion search is
+  // NOT a cut, so it deliberately does not gate them — the bench stays usable
+  // while the AI reads.
+  const clipJobRunning = clipJobs.some(clipJobFilter)
   const justCompletedRef = useRef(new Set())
 
   // Data
   const [sources, setSources] = useState([])
   const [clips, setClips] = useState([])
+  // The list endpoint pages; `total` says how many exist so the header
+  // doesn't silently undercount a heavy user's library.
+  const [clipTotal, setClipTotal] = useState(null)
   const [loading, setLoading] = useState(true)
   const [selectedSourceId, setSelectedSourceId] = useState(null) // "all" or video id
   const [selectedClip, setSelectedClip] = useState(null)
   const [sourceFilter, setSourceFilter] = useState("")
+  const [previewVideo, setPreviewVideo] = useState(null) // source video for the play popup
   const [searchQuery, setSearchQuery] = useState("")
   const [sortBy, setSortBy] = useState("virality") // virality | newest | duration
   const [sortAnchor, setSortAnchor] = useState(null)
@@ -385,15 +381,41 @@ export default function ClipStudio() {
   // Regen thumbnail
   const [regenThumb, setRegenThumb] = useState(false)
 
+  // Which surface the centre column shows.
+  //   "bench" — work ON the selected source: scrub it, drag ranges over a
+  //             filmstrip, watch the IN/OUT frames, then cut.
+  //   "clip"  — inspect one finished clip (the original behaviour).
+  // Selecting a source used to leave the centre blank whenever that source had
+  // no clips yet, which is exactly the moment a workspace is most useful.
+  const [centerMode, setCenterMode] = useState("bench")
+
+  // Per-clip settings (captions / emoji / silence / vertical / transcription)
+  // are owned HERE and handed to both surfaces. They used to be duplicated
+  // inside the dialog and would have been duplicated again in the bench, so a
+  // caption style picked in one did nothing in the other and whichever surface
+  // you happened to finish in decided the render.
+  const clipSettings = useClipSettings()
+
   // Video player ref
   const videoRef = useRef(null)
+
+  // Pause every player on the page whenever the source-video preview opens,
+  // so two videos aren't playing — and both audible — at the same time. The
+  // bench player lives inside SourceBench, so a ref to the inspector alone
+  // missed it and the bench kept talking under the preview.
+  useEffect(() => {
+    if (previewVideo) document.querySelectorAll("video").forEach(v => { try { v.pause() } catch { /* detached */ } })
+  }, [previewVideo])
 
   // ── Load data ────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
     try {
       const [srcRes, clipRes] = await Promise.all([
         http.get("/api/downloaded", { params: { limit: 200 } }),
-        http.get("/api/videos", { params: { limit: 100 } }),
+        // Filter server-side: an unfiltered page of 100 could be entirely
+        // recent non-clip rows, rendering "No clips yet" over a library full
+        // of clips.
+        http.get("/api/videos", { params: { limit: 100, source_type: "clip_extraction" } }),
       ])
       // Show all downloaded videos (sorted longest first — best for clipping)
       const downloadedVideos = (srcRes.data?.videos || srcRes.data || [])
@@ -403,6 +425,7 @@ export default function ClipStudio() {
       // Only show clip_extraction videos
       const clipVideos = (clipRes.data.videos || []).filter(v => v.source_type === "clip_extraction")
       setClips(clipVideos)
+      setClipTotal(typeof clipRes.data.total === "number" ? clipRes.data.total : null)
 
       // Don't auto-select — let user choose from filmstrip or sidebar
     } catch (e) {
@@ -415,9 +438,17 @@ export default function ClipStudio() {
 
   useEffect(() => { fetchData() }, [fetchData])
 
-  // Auto-refresh when a clip extraction job completes
+  // Auto-refresh when a clip extraction OR suggestion job completes. The
+  // suggestion half matters for a non-obvious reason: Ask AI may run Whisper
+  // and back-fill the source row's transcript, and useClipSettings derives
+  // force_retranscribe from has_transcript_segments — left stale, the next
+  // Cut re-ran the whole Whisper pass Ask AI had just spent minutes on.
+  const refreshJobs = useMemo(
+    () => Object.values(activeJobs).filter(
+      j => isClipJob(j) || j.inputData?.type === "clip_suggestion"),
+    [activeJobs])  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    for (const job of clipJobs) {
+    for (const job of refreshJobs) {
       if ((job.status === "success" || job.status === "failed") && !justCompletedRef.current.has(job.jobId)) {
         justCompletedRef.current.add(job.jobId)
         // Prevent unbounded growth — keep only the last 50 entries
@@ -431,18 +462,47 @@ export default function ClipStudio() {
         }
       }
     }
-  }, [clipJobs, fetchData])
+  }, [refreshJobs, fetchData])
 
   // ── Derived data ─────────────────────────────────────────────
-  const clipCountBySource = {}
-  clips.forEach(c => {
-    const sid = c.source_downloaded_video_id
-    if (sid) clipCountBySource[sid] = (clipCountBySource[sid] || 0) + 1
-  })
+  // Memoized: dragging a bench handle updates range state owned by this page,
+  // so every pointermove re-renders ClipStudio — these must not rebuild (and
+  // the filmstrip must not re-sort) per mouse event.
+  const clipCountBySource = useMemo(() => {
+    const counts = {}
+    clips.forEach(c => {
+      const sid = c.source_downloaded_video_id
+      if (sid) counts[sid] = (counts[sid] || 0) + 1
+    })
+    return counts
+  }, [clips])
+
+  // The source the bench works on. "all" is a review filter, not a video, so
+  // it has no bench.
+  const benchSource = (selectedSourceId && selectedSourceId !== "all")
+    ? sources.find(v => v.id === selectedSourceId) || null
+    : null
+
+  const onBench = !!benchSource && centerMode === "bench"
+
+  // The bench's pending cuts are owned HERE, like clipSettings above, because
+  // the button that spends them lives in the page hero next to Auto-cut — the
+  // app's convention is that the primary action sits top-right, and Cut is the
+  // primary action of this page. The bench renders the timeline and the rail
+  // off this same object, so there is still exactly one list.
+  const benchRanges = useBenchRanges(
+    benchSource?.id || null, benchSource?.duration_seconds || 0)
+
+  // A source shorter than one clip can't be cut at all.
+  const benchTooShort = !!benchSource
+    && (benchSource.duration_seconds || 0) > 0
+    && (benchSource.duration_seconds || 0) < MIN_LEN_SEC
+
+  const cutCount = benchRanges.ranges.length
 
   // Only show clips when a source is selected (or "all" explicitly chosen)
   const showAllClips = selectedSourceId === "all"
-  const filteredClips = clips
+  const filteredClips = useMemo(() => clips
     .filter(c => {
       if (!selectedSourceId && !showAllClips) return false  // nothing selected → show nothing
       if (selectedSourceId && selectedSourceId !== "all") {
@@ -460,27 +520,77 @@ export default function ClipStudio() {
       if (sortBy === "newest") return new Date(b.created_at || 0) - new Date(a.created_at || 0)
       if (sortBy === "duration") return (b.duration_seconds || 0) - (a.duration_seconds || 0)
       return 0
-    })
+    }), [clips, selectedSourceId, showAllClips, searchQuery, sortBy])
 
   // ── Handlers ─────────────────────────────────────────────────
 
   const handleExtract = async (videoId, opts) => {
     setExtracting(true)
     try {
+      const isManual = opts.mode === "manual"
+      // Only send a knob when the user actually set it — the default request
+      // shape (and thus behavior) stays identical to before this feature.
       const payload = { caption_style: opts.caption_style }
       if (opts.force_retranscribe) {
         payload.whisper_quality = opts.whisper_quality
         payload.force_retranscribe = true
       }
-      if (opts.min_duration) payload.min_duration = opts.min_duration
-      if (opts.max_duration) payload.max_duration = opts.max_duration
+      // emoji_style default is "moderate" — only send when overridden.
+      if (opts.emoji_style && opts.emoji_style !== "moderate") payload.emoji_style = opts.emoji_style
+      // remove_silence applies in BOTH modes. It was gated out of manual mode
+      // on the theory that trimming would "shift the user's chosen timing" —
+      // but the backend removes silence INSIDE each already-cut clip (extract
+      // → desilence, see _process_clips_parallel), so the picked range
+      // boundaries are untouched; the clip just gets tighter. The gate only
+      // made hand-picked clips the one place pacing could NOT be fixed.
+      if (opts.remove_silence) payload.remove_silence = true
+      if (opts.force_vertical) payload.force_vertical = true
+
+      if (isManual) {
+        payload.mode = "manual"
+        payload.time_ranges = opts.time_ranges
+      } else {
+        if (opts.min_duration) payload.min_duration = opts.min_duration
+        if (opts.max_duration) payload.max_duration = opts.max_duration
+        // Cap on clip count (the backend clamps 1..99 and auto-scales down
+        // when the content can't support that many; omitted = ~1 per 30s).
+        if (opts.max_clips) payload.max_clips = opts.max_clips
+        if (opts.user_query && opts.user_query.trim()) payload.user_query = opts.user_query.trim()
+        if (opts.target_platform) payload.target_platform = opts.target_platform
+        if (opts.genre) payload.genre = opts.genre
+      }
+
       await http.post(`/api/downloaded/${videoId}/extract-clips`, payload)
-      showSnackbar("Extracting viral clips — AI will find the best moments", "success")
+      showSnackbar(
+        isManual
+          ? `Cutting ${opts.time_ranges?.length || "your"} clip${opts.time_ranges?.length !== 1 ? "s" : ""} at the times you picked`
+          : "Extracting viral clips — AI will find the best moments",
+        "success",
+      )
+      return true
     } catch (e) {
       showSnackbar(`Extract failed: ${e.response?.data?.detail || e.message}`, "error")
+      return false
     } finally {
       setExtracting(false)
     }
+  }
+
+  /* The bench's one destructive act. It lives here rather than in SourceBench
+     because its button is in the hero — see benchRanges above. */
+  const doCut = async () => {
+    if (!benchSource || !cutCount || extracting || clipJobRunning) return
+    const ok = await handleExtract(benchSource.id, {
+      ...clipSettings.toPayload({ hasTranscript: !!benchSource.has_transcript_segments }),
+      mode: "manual",
+      time_ranges: benchRanges.ranges.map(({ start, end }) => ({ start, end })),
+    })
+    // Spent ranges must not stay armed. The button re-enables the moment the
+    // job finishes and it re-rendered the SAME "Cut N clips" over the SAME
+    // blocks, so a second click re-cut clips the user already had. (The ghost
+    // lane drew them, but nothing stopped the cut.) Only on success: a failed
+    // submit should leave the user's work intact so they can fix it and retry.
+    if (ok) benchRanges.clear()
   }
 
   const handleUpload = async (platform) => {
@@ -505,14 +615,36 @@ export default function ClipStudio() {
     }
   }
 
+  // The list row carries no `script` (payload weight), so the inspector's
+  // Transcript section rendered for no clip, ever. Fetch the detail row once
+  // per selected clip and merge; the guard set stops a null script refetching.
+  const scriptFetchedRef = useRef(new Set())
+  useEffect(() => {
+    const id = selectedClip?.id
+    if (!id || selectedClip.script !== undefined || scriptFetchedRef.current.has(id)) return
+    scriptFetchedRef.current.add(id)
+    let alive = true
+    http.get(`/api/videos/${id}`).then(({ data }) => {
+      if (!alive || !data) return
+      const patch = { script: data.script ?? null }
+      setSelectedClip(prev => (prev?.id === id ? { ...prev, ...patch } : prev))
+      setClips(prev => prev.map(c => (c.id === id ? { ...c, ...patch } : c)))
+    }).catch(() => { /* detail fetch is best-effort; the section just stays hidden */ })
+    return () => { alive = false }
+  }, [selectedClip])
+
   const handleRegenThumbnail = async () => {
     if (!selectedClip) return
     setRegenThumb(true)
     try {
       const res = await http.post(`/api/videos/${selectedClip.id}/regenerate-thumbnail`)
       showSnackbar("Thumbnail regenerated!", "success")
-      setSelectedClip(prev => ({ ...prev, thumbnail_path: res.data.thumbnail_path }))
-      setClips(prev => prev.map(c => c.id === selectedClip.id ? { ...c, thumbnail_path: res.data.thumbnail_path } : c))
+      // thumb_v busts the thumbnail URL — without a new value the regenerated
+      // image never appears: same URL, so React doesn't reload the <img> and
+      // the browser serves the bytes it already has.
+      const thumbV = Date.now()
+      setSelectedClip(prev => ({ ...prev, thumbnail_path: res.data.thumbnail_path, thumb_v: thumbV }))
+      setClips(prev => prev.map(c => c.id === selectedClip.id ? { ...c, thumbnail_path: res.data.thumbnail_path, thumb_v: thumbV } : c))
     } catch (e) {
       showSnackbar(`Thumbnail regen failed: ${e.response?.data?.detail || e.message}`, "error")
     } finally {
@@ -581,7 +713,7 @@ export default function ClipStudio() {
               Clip Studio
             </Typography>
             <Typography variant="caption" sx={{ color: "text.secondary" }}>
-              {clips.length} clip{clips.length !== 1 ? "s" : ""} from {sources.length} video{sources.length !== 1 ? "s" : ""}
+              {clipTotal ?? clips.length} clip{(clipTotal ?? clips.length) !== 1 ? "s" : ""} from {sources.length} video{sources.length !== 1 ? "s" : ""}{clipTotal > clips.length ? ` · showing latest ${clips.length}` : ""}
             </Typography>
           </Box>
         </Stack>
@@ -632,6 +764,60 @@ export default function ClipStudio() {
               Refresh
             </Button>
           </Tooltip>
+
+          {/* Cut, then Auto-cut. Same treatment — they are two ways of doing
+              one thing and neither is a lesser button — so the ICON carries
+              the difference: scissors for the cuts you chose, a wand for the
+              ones the AI chooses. They used to share the scissors, which is
+              what made them read as duplicates.
+
+              `describeChild` on the tooltips: without it MUI promotes the
+              title to the button's accessible NAME, so Auto-cut announced
+              itself as a paragraph about Ask AI rather than as "Auto-cut". */}
+          {onBench && (
+            <Tooltip describeChild title={benchTooShort
+              ? "This video is shorter than one second — there is nothing to cut"
+              : cutCount
+                ? "Cut exactly the ranges on the timeline"
+                : "Drag on the filmstrip, press N, or Ask AI to add a range first"}>
+              <span>
+                <Button
+                  size="small" variant="contained" color="primary"
+                  disabled={!cutCount || extracting || clipJobRunning || benchTooShort}
+                  startIcon={(extracting || clipJobRunning)
+                    ? <CircularProgress size={14} color="inherit" />
+                    : <ContentCutIcon fontSize="small" />}
+                  onClick={doCut}
+                  sx={{ textTransform: "none", whiteSpace: "nowrap", fontWeight: 700 }}
+                >
+                  {clipJobRunning
+                    ? "Cutting…"
+                    : cutCount
+                      ? `Cut ${cutCount} clip${cutCount !== 1 ? "s" : ""}`
+                      : "Cut clips"}
+                </Button>
+              </span>
+            </Tooltip>
+          )}
+          {selectedSourceId && selectedSourceId !== "all" && (
+            <Tooltip describeChild title="AI picks the moments and cuts them straight away — no review step, any number of clips. To see the picks first and adjust them, use Ask AI on the bench.">
+              <span>
+                <Button
+                  size="small" variant="contained" color="primary"
+                  disabled={extracting || clipJobRunning}
+                  startIcon={(extracting || clipJobRunning)
+                    ? <CircularProgress size={14} color="inherit" />
+                    : <AutoFixHighIcon fontSize="small" />}
+                  onClick={() => {
+                    const src = sources.find(v => v.id === selectedSourceId)
+                    if (src) { setExtractTarget(src); setExtractDialogOpen(true) }
+                  }}
+                  sx={{ textTransform: "none", whiteSpace: "nowrap" }}>
+                  {clipJobRunning ? "Cutting…" : "Auto-cut"}
+                </Button>
+              </span>
+            </Tooltip>
+          )}
         </Stack>
       </Box>
 
@@ -692,6 +878,7 @@ export default function ClipStudio() {
               video={v}
               clipCount={clipCountBySource[v.id] || 0}
               isSelected={selectedSourceId === v.id}
+              onPreview={setPreviewVideo}
               onClick={() => {
                 const newId = selectedSourceId === v.id ? null : v.id
                 setSelectedSourceId(newId)
@@ -716,10 +903,45 @@ export default function ClipStudio() {
           )}
         </Box>
 
-        {/* ── Center: Preview + Details ──────────────────────── */}
+        {/* ── Center: Cutting bench | Clip inspector ─────────── */}
         <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
 
-          {selectedClip ? (
+          {/* Mode switch — only meaningful when both surfaces have something
+              to show, so it stays hidden until they do. */}
+          {benchSource && selectedClip && (
+            <Stack direction="row" alignItems="center" spacing={1}
+              sx={{ px: 2, pt: 1.5, pb: 0.5, flexShrink: 0 }}>
+              <ToggleButtonGroup
+                size="small" exclusive value={centerMode}
+                onChange={(_, v) => v && setCenterMode(v)}
+                sx={{ "& .MuiToggleButton-root": { textTransform: "none", py: 0.25, px: 1.25, fontSize: "0.75rem", fontWeight: 700 } }}
+              >
+                <ToggleButton value="bench">
+                  <MovieFilterOutlinedIcon sx={{ fontSize: 15, mr: 0.5 }} />Bench
+                </ToggleButton>
+                <ToggleButton value="clip">
+                  <SlideshowOutlinedIcon sx={{ fontSize: 15, mr: 0.5 }} />Clip
+                </ToggleButton>
+              </ToggleButtonGroup>
+              <Typography variant="caption" sx={{ color: "text.disabled" }}>
+                {centerMode === "bench"
+                  ? "Cut new clips from the source"
+                  : "Review and edit a finished clip"}
+              </Typography>
+            </Stack>
+          )}
+
+          {benchSource && centerMode === "bench" ? (
+            <SourceBench
+              key={benchSource.id}
+              source={benchSource}
+              ranges={benchRanges}
+              existingClips={clips.filter(c => c.source_downloaded_video_id === benchSource.id)}
+              settings={clipSettings.settings}
+              onSettings={clipSettings.update}
+              onOpenDialog={() => { setExtractTarget(benchSource); setExtractDialogOpen(true) }}
+            />
+          ) : selectedClip ? (
             <Box sx={{ flex: 1, overflow: "auto", p: 3 }}>
               <Box sx={{ display: "flex", gap: 3, maxWidth: 1200, mx: "auto" }}>
 
@@ -766,8 +988,21 @@ export default function ClipStudio() {
                         color={viralityColor(selectedClip.clip_virality_score)}
                       />
                     )}
+                    {selectedClip.clip_hook_score != null && (
+                      <Chip
+                        label={`Hook ${selectedClip.clip_hook_score.toFixed(1)}/10`}
+                        size="small" variant="outlined"
+                        color={selectedClip.clip_hook_score >= 8 ? "success" : selectedClip.clip_hook_score >= 5 ? "warning" : "error"}
+                      />
+                    )}
+                    {hookTypeLabel(selectedClip.clip_hook_type) && (
+                      <Chip
+                        label={hookTypeLabel(selectedClip.clip_hook_type)}
+                        size="small" variant="outlined" color="primary"
+                      />
+                    )}
                     <Chip label={`${formatTime(selectedClip.duration_seconds)}`} icon={<AccessTimeIcon />} size="small" variant="outlined" />
-                    <Chip label="9:16" size="small" variant="outlined" />
+                    <Chip label={selectedClip.aspect_ratio || "9:16"} size="small" variant="outlined" />
                     {selectedClip.caption_status === "applied" && (
                       <Chip icon={<CheckCircleIcon />} label="Captions" size="small" color="success" variant="outlined" />
                     )}
@@ -850,6 +1085,11 @@ export default function ClipStudio() {
                           </Typography>
                         )}
                       </Box>
+
+                      {/* 5-factor virality scoreboard — Hook / Flow / Value /
+                          Trend / Share bars. Hides itself for legacy clips that
+                          carry neither a hook score nor a breakdown. */}
+                      <ScoreBreakdownPanel clip={selectedClip} />
 
                       {/* YouTube */}
                       {selectedClip.youtube_title && (
@@ -942,22 +1182,16 @@ export default function ClipStudio() {
                 Clips ({filteredClips.length})
               </Typography>
               <Box sx={{ flex: 1 }} />
-              {/* Extract button for selected source */}
-              {selectedSourceId && selectedSourceId !== "all" && (
-                <Button size="small" variant="contained" color="primary"
-                  startIcon={extracting ? <CircularProgress size={14} color="inherit" /> : <ContentCutIcon />}
-                  disabled={extracting}
-                  onClick={() => {
-                    const src = sources.find(s => s.id === selectedSourceId)
-                    if (src) { setExtractTarget(src); setExtractDialogOpen(true) }
-                  }}
-                  sx={{ textTransform: "none", height: 30, fontSize: "0.8rem", fontWeight: 700, px: 2, borderRadius: 2 }}>
-                  Extract Clips
-                </Button>
-              )}
+              {/* The "Extract Clips" button that used to sit here is now
+                  "Auto-cut" in the page hero, beside "Cut N clips". Leaving a
+                  third door to the same dialog down here — under a heading
+                  about clips you have ALREADY cut — made it read as a
+                  different act from the one in the corner. */}
             </Stack>
             <Box sx={{
-              display: "flex", flexWrap: "nowrap", gap: 1.5, px: 2, pb: 2, pt: 0.5,
+              // flex-start: with mixed aspects, a landscape card must not
+              // stretch to portrait height with dead space under it.
+              display: "flex", flexWrap: "nowrap", alignItems: "flex-start", gap: 1.5, px: 2, pb: 2, pt: 0.5,
               overflowX: "auto", overflowY: "hidden",
               "&::-webkit-scrollbar": { height: 6 },
               "&::-webkit-scrollbar-thumb": { bgcolor: "divider", borderRadius: 3 },
@@ -974,7 +1208,7 @@ export default function ClipStudio() {
                     key={clip.id}
                     clip={clip}
                     isSelected={selectedClip?.id === clip.id}
-                    onClick={() => setSelectedClip(clip)}
+                    onSelect={setSelectedClip}
                   />
                 ))
               )}
@@ -989,7 +1223,29 @@ export default function ClipStudio() {
         onClose={() => setExtractDialogOpen(false)}
         video={extractTarget}
         onExtract={handleExtract}
+        settings={clipSettings.settings}
+        onSettings={clipSettings.update}
       />
+
+      {/* Source video preview popup — video sizes to its natural aspect ratio
+          (capped at 80vw/80vh), NOT stretched to the dialog width. */}
+      <Dialog
+        open={!!previewVideo}
+        onClose={() => setPreviewVideo(null)}
+        maxWidth="md"
+        slotProps={{ paper: { sx: { bgcolor: "#000", width: "auto" } } }}
+      >
+        <DialogContent sx={{ p: 0, lineHeight: 0 }}>
+          {previewVideo && (
+            <Box
+              component="video"
+              src={`/api/downloaded/${previewVideo.id}/stream`}
+              controls autoPlay
+              style={{ display: "block", maxWidth: "80vw", maxHeight: "80vh" }}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </Box>
   )
 }

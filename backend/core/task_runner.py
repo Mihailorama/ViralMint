@@ -9,6 +9,8 @@ import asyncio
 import json
 import logging
 
+from backend.services.clip_options import ExtractOptions
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,12 @@ async def run_download(job_id: str, scout_result_ids: list[str], user_id: str = 
     from backend.agents.analyzer import AnalyzerAgent
     try:
         await DownloadAgent().run(job_id=job_id, scout_result_ids=scout_result_ids, user_id=user_id)
+        # A cancelled download is settled by the agent itself — don't start a
+        # (long) analysis pass the user already said no to.
+        from backend.agents.job_helper import job_cancelled
+        if await job_cancelled(job_id):
+            logger.info("TASK CANCELLED download | job=%s (analysis skipped)", job_id[:8])
+            return
         await AnalyzerAgent().run(job_id=job_id, user_id=user_id)
         logger.info("TASK DONE  download | job=%s", job_id[:8])
     except Exception as e:
@@ -70,6 +78,9 @@ async def run_generate(
     music_genre: str = None,
     custom_script: str = None,
     start_image: str = None,
+    user_images: list[str] = None,
+    visual_style: str = None,
+    transition_style: str = None,
     **_ignored,  # absorb deprecated params (gen_tier, video_model, etc.)
 ):
     logger.info("TASK START generate | job=%s video=%s tts=%s", job_id[:8], (downloaded_video_id or "none")[:8], tts_provider)
@@ -82,7 +93,8 @@ async def run_generate(
             caption_style=caption_style,
             caption_enabled=caption_enabled, music_enabled=music_enabled,
             music_genre=music_genre, custom_script=custom_script,
-            start_image=start_image,
+            start_image=start_image, user_images=user_images,
+            visual_style=visual_style, transition_style=transition_style,
         )
         logger.info("TASK DONE  generate | job=%s", job_id[:8])
     except Exception as e:
@@ -91,11 +103,42 @@ async def run_generate(
         await update_job_status(job_id, "failed", error_message=str(e))
 
 
-async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = "local"):
+async def _settle_if_cancelled(job_id: str, err: Exception, what: str) -> bool:
+    """Finish a runner that raised, when the user had already cancelled it.
+
+    Cancellation is cooperative, so the in-flight transfer routinely fails
+    AFTER the cancel. The status stays "cancelled", the failure is kept as the
+    reason, and no red job_failed toast goes out for work the user already
+    stopped. Returns True when it handled the job; False means "a real
+    failure".
+    """
+    from backend.agents.job_helper import job_cancelled, update_job_status
+    from backend.core.exceptions import JobCancelledError
+    if not await job_cancelled(job_id):
+        return False
+    logger.info("TASK CANCELLED %s | job=%s (ended with: %s)", what, job_id[:8], err)
+    await update_job_status(job_id, "cancelled", error_message=(
+        None if isinstance(err, JobCancelledError) else str(err)))
+    return True
+
+
+async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = "local",
+                                  options: dict | None = None, analyze: bool = True):
     """Download multiple videos from a list of URLs, then analyze all.
-    urls: [{"url": "...", "title": "..."}, ...]"""
+    urls: [{"url": "...", "title": "..."}, ...]
+
+    `options`: shared per-download yt-dlp options (see
+    backend/services/download_options.py) applied to EVERY url in the batch.
+    None → the pre-existing default path for every caller that predates it.
+
+    `analyze`: run Whisper + insight extraction over everything downloaded.
+    True for every pre-existing caller (channel analysis and the chat planner
+    both want the transcripts). The Video Download tool page passes False: it
+    was asked for the files, and transcribing a 40-minute video the user only
+    wanted on disk is minutes of work nobody asked for — Library can analyze
+    on demand."""
     logger.info("TASK START batch_download | job=%s count=%d", job_id[:8], len(urls))
-    from backend.agents.job_helper import update_job_status
+    from backend.agents.job_helper import update_job_status, job_cancelled
     from backend.core.ws_manager import ws_manager
     from backend.core.exceptions import RateLimitError
 
@@ -104,8 +147,14 @@ async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = 
     try:
         total = len(urls)
         downloaded_ids = []
+        # Per-video delivery summaries ({id, title, height, requested_quality,
+        # ext, subtitle_files, extras_dropped}) — persisted in the job's
+        # output_data so the Video Download page can report what was DELIVERED
+        # vs what the options asked for.
+        video_summaries = []
         errors = []
         rate_limited = False
+        cancelled = False
 
         for i, item in enumerate(urls):
             video_url = item.get("url", "")
@@ -117,6 +166,21 @@ async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = 
                 errors.append(f"Video {i + 1}/{total} '{video_title[:40]}': Skipped (rate-limited)")
                 continue
 
+            # Cooperative cancellation, polled at the one boundary that
+            # matters: BEFORE the next transfer starts. yt-dlp runs inside
+            # asyncio.to_thread and cannot be interrupted, so the video already
+            # in flight will finish and is KEPT (deleting the user's file is the
+            # one irreversible move) — but every video after it is skipped.
+            # This was the one runner family that never polled at all, so a
+            # cancelled 10-URL batch downloaded all 10 anyway.
+            if await job_cancelled(job_id):
+                cancelled = True
+                logger.info(
+                    "TASK CANCELLED batch_download | job=%s (stopped before %d/%d)",
+                    job_id[:8], i + 1, total,
+                )
+                break
+
             step = f"Downloading video {i + 1}/{total}: {video_title[:50] or video_url[:50]}"
             base_pct = (i / total) * 70  # 0% to 70% for downloads
             await ws_manager.send_progress(job_id, base_pct, step, user_id)
@@ -127,9 +191,11 @@ async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = 
                 await asyncio.sleep(jittered_delay())
 
             try:
-                dv_id = await _download_single_video_to_db(job_id, video_url, video_title, user_id)
-                if dv_id:
-                    downloaded_ids.append(dv_id)
+                dl = await _download_single_video_to_db(
+                    job_id, video_url, video_title, user_id, options=options)
+                if dl:
+                    downloaded_ids.append(dl["id"])
+                    video_summaries.append(dl)
             except RateLimitError as e:
                 rate_limited = True
                 errors.append(f"Video {i + 1}/{total} '{video_title[:40]}': {e}")
@@ -148,6 +214,33 @@ async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = 
         if errors:
             error_summary = f"Failed {len(errors)}/{total} download(s):\n" + "\n".join(errors)
 
+        # A cancel is neither a failure nor a success. Leave the row on the
+        # "cancelled" the user asked for, skip the (expensive) analysis pass,
+        # and say what actually landed — the in-flight video may well have
+        # completed, and it IS in the Library.
+        #
+        # Polled AGAIN here, not only at the top of the loop: a cancel that
+        # lands during the LAST transfer — the only transfer, for a one-URL
+        # batch, which is the common case — is never seen by the loop gate.
+        if cancelled or await job_cancelled(job_id):
+            # The STATUS stays "cancelled" — that is what the user asked for.
+            # But the reason is kept: this branch used to drop `error_summary`
+            # entirely, so a job that was cancelled AND failed reported no
+            # error at all. A cancel arriving while a doomed transfer is in
+            # flight is the COMMON case, not an edge one, because the transfer
+            # cannot be interrupted and only surfaces its error minutes later.
+            step = f"Cancelled — {len(downloaded_ids)}/{total} downloaded before stopping"
+            if errors:
+                step += f" ({len(errors)} also failed — see details)"
+            await update_job_status(
+                job_id, "cancelled",
+                current_step=step,
+                error_message=error_summary,   # None when nothing failed
+                output_data={"downloaded_ids": downloaded_ids, "total": total,
+                             "videos": video_summaries, "cancelled": True},
+            )
+            return
+
         if not downloaded_ids:
             user_msg = (
                 "YouTube is rate-limiting downloads from this IP. Try again in 10-15 minutes."
@@ -156,18 +249,28 @@ async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = 
             )
             raise Exception(user_msg)
 
-        # Analyze all downloaded videos
-        await ws_manager.send_progress(job_id, 75, f"Analyzing {len(downloaded_ids)} videos...", user_id)
-        await update_job_status(job_id, "running", progress_pct=75, current_step=f"Analyzing {len(downloaded_ids)} videos...")
+        if analyze:
+            # Analyze all downloaded videos
+            await ws_manager.send_progress(job_id, 75, f"Analyzing {len(downloaded_ids)} videos...", user_id)
+            await update_job_status(job_id, "running", progress_pct=75, current_step=f"Analyzing {len(downloaded_ids)} videos...")
 
-        from backend.agents.analyzer import AnalyzerAgent
-        await AnalyzerAgent().run(job_id=job_id, user_id=user_id)
+            from backend.agents.analyzer import AnalyzerAgent
+            await AnalyzerAgent().run(job_id=job_id, user_id=user_id)
 
         await update_job_status(
             job_id, "success",
             progress_pct=100,
-            current_step=f"Downloaded and analyzed {len(downloaded_ids)}/{total} videos",
-            output_data={"downloaded_ids": downloaded_ids, "total": total},
+            current_step=(
+                f"Downloaded and analyzed {len(downloaded_ids)}/{total} videos"
+                if analyze else
+                f"Downloaded {len(downloaded_ids)}/{total} videos — open Library to analyze"
+            ),
+            # `videos` carries what each download DELIVERED (height/ext/
+            # subtitle sidecars) so the Video Download page can show "asked for
+            # 4K, this source had 1080p" instead of implying every option was
+            # honoured.
+            output_data={"downloaded_ids": downloaded_ids, "total": total,
+                         "videos": video_summaries},
             error_message=error_summary if errors else None,
         )
         await ws_manager.send({
@@ -177,6 +280,8 @@ async def run_batch_download_urls(job_id: str, urls: list[dict], user_id: str = 
         }, user_id)
 
     except Exception as e:
+        if await _settle_if_cancelled(job_id, e, "batch_download"):
+            return
         logger.error(f"Batch download task failed: {e}", exc_info=True)
         from backend.agents.job_helper import update_job_status as _update
         await _update(job_id, "failed", error_message=str(e))
@@ -202,6 +307,8 @@ async def run_download_url(job_id: str, url: str, title: str = "", user_id: str 
             await _download_single_url(job_id, url, title, user_id)
 
     except Exception as e:
+        if await _settle_if_cancelled(job_id, e, "download_url"):
+            return
         logger.error(f"URL download task failed: {e}", exc_info=True)
         from backend.agents.job_helper import update_job_status as _update
         await _update(job_id, "failed", error_message=str(e))
@@ -215,7 +322,7 @@ async def run_download_url(job_id: str, url: str, title: str = "", user_id: str 
 
 async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int = 5):
     """Download top N videos from a channel/playlist, then analyze each."""
-    from backend.agents.job_helper import update_job_status
+    from backend.agents.job_helper import update_job_status, job_cancelled
     from backend.services.ytdlp_service import list_channel_videos
     from backend.core.ws_manager import ws_manager
     from backend.core.exceptions import RateLimitError
@@ -233,6 +340,11 @@ async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int
 
     downloaded_ids = []
     rate_limited = False
+    cancelled = False
+    # Per-video failures, kept so the job can say WHY. They used to be logged
+    # and dropped, so a channel whose every video failed reported only "All
+    # video downloads failed".
+    errors: list[str] = []
     for i, video in enumerate(videos):
         video_url = video.get("url", "")
         video_title = video.get("title", "")
@@ -241,6 +353,17 @@ async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int
 
         if rate_limited:
             continue
+
+        # Same cooperative gate as run_batch_download_urls — stop before the
+        # next transfer instead of pulling the whole channel after the user hit
+        # cancel.
+        if await job_cancelled(job_id):
+            cancelled = True
+            logger.info(
+                "TASK CANCELLED download_channel | job=%s (stopped before %d/%d)",
+                job_id[:8], i + 1, total,
+            )
+            break
 
         step = f"Downloading video {i + 1}/{total}: {video_title[:50]}"
         base_pct = 10 + (i / total) * 60  # 10% to 70% for downloads
@@ -252,11 +375,12 @@ async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int
             await asyncio.sleep(jittered_delay())
 
         try:
-            dv_id = await _download_single_video_to_db(job_id, video_url, video_title, user_id)
-            if dv_id:
-                downloaded_ids.append(dv_id)
+            dl = await _download_single_video_to_db(job_id, video_url, video_title, user_id)
+            if dl:
+                downloaded_ids.append(dl["id"])
         except RateLimitError as e:
             rate_limited = True
+            errors.append(f"Video {i + 1}/{total} '{video_title[:40]}': {e}")
             logger.warning(f"Rate limited on channel video {i + 1}/{total}, skipping remaining: {e}")
             await ws_manager.send_constraint_warning(
                 constraint="rate_limit",
@@ -265,14 +389,37 @@ async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int
                 user_id=user_id,
             )
         except Exception as e:
+            errors.append(f"Video {i + 1}/{total} '{video_title[:40]}': {e}")
             logger.warning(f"Failed to download {video_url}: {e}")
             continue
+
+    error_summary = (
+        f"Failed {len(errors)}/{total} download(s):\n" + "\n".join(errors)
+        if errors else None
+    )
+
+    # Cancel wins over both the failure and the success write below, and is
+    # re-polled so a cancel during the last transfer is honoured too (see the
+    # same gate in run_batch_download_urls). The failures are kept as the
+    # reason — a cancelled job that also failed must not read as clean.
+    if cancelled or await job_cancelled(job_id):
+        step = f"Cancelled — {len(downloaded_ids)}/{total} downloaded before stopping"
+        if errors:
+            step += f" ({len(errors)} also failed — see details)"
+        await update_job_status(
+            job_id, "cancelled",
+            current_step=step,
+            error_message=error_summary,
+            output_data={"downloaded_ids": downloaded_ids, "url": url,
+                         "total": total, "cancelled": True},
+        )
+        return
 
     if not downloaded_ids:
         raise Exception(
             "YouTube is rate-limiting downloads from this IP. Try again in 10-15 minutes."
             if rate_limited else
-            "All video downloads failed"
+            (error_summary or "All video downloads failed")
         )
 
     # Analyze all downloaded videos
@@ -287,6 +434,7 @@ async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int
         progress_pct=100,
         current_step=f"Downloaded and analyzed {len(downloaded_ids)} videos",
         output_data={"downloaded_ids": downloaded_ids, "url": url, "total": total},
+        error_message=error_summary,
     )
     await ws_manager.send({
         "type": "job_complete",
@@ -297,12 +445,26 @@ async def _download_channel(job_id: str, url: str, user_id: str, max_videos: int
 
 async def _download_single_url(job_id: str, url: str, title: str, user_id: str):
     """Download a single video URL, save to DB, and analyze."""
-    from backend.agents.job_helper import update_job_status
+    from backend.agents.job_helper import update_job_status, job_cancelled
     from backend.core.ws_manager import ws_manager
 
     await ws_manager.send_progress(job_id, 10, "Downloading video...", user_id)
 
-    dv_id = await _download_single_video_to_db(job_id, url, title, user_id)
+    dv_id = (await _download_single_video_to_db(job_id, url, title, user_id))["id"]
+
+    # The transfer itself could not be interrupted, but the user's cancel still
+    # stands: no success write, no job_complete, no notification, and above all
+    # no minutes of Whisper on a video they told us to stop fetching. The file
+    # is kept — it is already on disk and in the Library.
+    if await job_cancelled(job_id):
+        logger.info("TASK CANCELLED download_url | job=%s (transfer had already started)",
+                    job_id[:8])
+        await update_job_status(
+            job_id, "cancelled",
+            current_step="Cancelled — the download had already finished; it is in your Library",
+            output_data={"downloaded_ids": [dv_id], "url": url, "cancelled": True},
+        )
+        return
 
     await ws_manager.send_progress(job_id, 70, "Analyzing video...", user_id)
 
@@ -322,8 +484,26 @@ async def _download_single_url(job_id: str, url: str, title: str, user_id: str):
     }, user_id)
 
 
-async def _download_single_video_to_db(job_id: str, url: str, title: str, user_id: str) -> str:
-    """Download one video, create DB records. Returns DownloadedVideo.id."""
+async def _download_single_video_to_db(job_id: str, url: str, title: str, user_id: str,
+                                       options: dict | None = None) -> dict:
+    """Download one video, create DB records.
+
+    Returns a delivery summary:
+        {"id": DownloadedVideo.id, "title": str,
+         "height": int|None, "requested_quality": str|None, "ext": str|None,
+         "subtitle_files": [str], "extras_dropped": bool}
+
+    `id` is what chaining callers need; the rest is what the user actually GOT
+    vs what the per-download `options` asked for (a quality cap degrades to
+    the closest available height, and a container request degrades to mkv when
+    codecs demand it; `ext` always comes from the file actually written).
+    Callers that surface results to a human or an LLM should pass the summary
+    through so "asked for 4K" is never silently presented as "got 4K".
+
+    `options`: see backend/services/download_options.py. None → the
+    pre-existing default path, byte-identical for every caller that predates
+    this parameter.
+    """
     from backend.models.downloaded_video import DownloadedVideo
     from backend.models.scout_result import ScoutResult
     from backend.services.ytdlp_service import download_video
@@ -332,6 +512,9 @@ async def _download_single_video_to_db(job_id: str, url: str, title: str, user_i
     from backend.agents.scout import compute_virality_score
     from uuid import uuid4
     from datetime import datetime
+    from pathlib import Path
+
+    from backend.core.exceptions import DownloadStalledError, DownloadTimeoutError
 
     video_id = str(uuid4())[:12]
 
@@ -341,7 +524,15 @@ async def _download_single_video_to_db(job_id: str, url: str, title: str, user_i
             output_dir=settings.VIDEOS_DIR,
             filename=video_id,
             extract_audio=True,
+            # None for every pre-existing caller → byte-identical download.
+            options=options,
         )
+    except (DownloadStalledError, DownloadTimeoutError):
+        # ABANDONED, not failed: the worker thread is still running and still
+        # owns `<video_id>*.part`, which its own cleanup will delete later. A
+        # retry into the same stem would have its part-files deleted out from
+        # under it — so no AI URL-fix retry here.
+        raise
     except Exception as first_error:
         # AI-assisted retry: ask AI to fix the URL and try once more
         from backend.core.ai_retry import ai_fix_url
@@ -364,6 +555,7 @@ async def _download_single_video_to_db(job_id: str, url: str, title: str, user_i
             output_dir=settings.VIDEOS_DIR,
             filename=video_id,
             extract_audio=True,
+            options=options,
         )
         # If this also fails, the exception propagates naturally
         url = corrected_url  # Use corrected URL for DB records
@@ -447,7 +639,18 @@ async def _download_single_video_to_db(job_id: str, url: str, title: str, user_i
         db.add(dv)
         await db.commit()
         await db.refresh(dv)
-        return dv.id
+        return {
+            "id": dv.id,
+            "title": dv.title,
+            "height": dl_result.get("height"),
+            "requested_quality": dl_result.get("requested_quality"),
+            "ext": (Path(dl_result["video_path"]).suffix.lstrip(".").lower() or None)
+                   if dl_result.get("video_path") else None,
+            # Basenames, not full paths — enough for the UI to name the sidecar
+            # ("test_vid.en.srt") without spilling filesystem layout into cards.
+            "subtitle_files": [Path(p).name for p in dl_result.get("kept_subtitle_paths") or []],
+            "extras_dropped": bool(dl_result.get("option_postprocessors_dropped")),
+        }
 
 
 async def run_analyze_imported(job_id: str, downloaded_video_id: str, user_id: str = "local"):
@@ -729,6 +932,12 @@ A 2-3 sentence summary of who this channel is and what they do.
 3 specific, tactical recommendations for someone who wants to compete with or learn from this channel. Be concrete — mention specific content ideas or strategies.
 
 Keep it concise and data-driven. Reference specific numbers from the video data. Do not add disclaimers or filler."""
+# The channel's titles and description are the source: a Chinese channel gets
+# its strategy in Chinese (Claude does not infer the language — prompt_rules).
+CHANNEL_ANALYSIS_PROMPT += (
+    "\n\nLANGUAGE: write the breakdown in the language of the channel's titles "
+    "and description above."
+)
 
 
 async def _generate_channel_ai_analysis(summary: dict, user_id: str) -> str:
@@ -786,19 +995,179 @@ async def _generate_channel_ai_analysis(summary: dict, user_id: str) -> str:
         return ""
 
 
+async def run_suggest_clips(
+    job_id: str,
+    downloaded_video_id: str,
+    opts: ExtractOptions,
+    user_id: str = "local",
+):
+    """Find viral moments and RETURN them — cut nothing.
+
+    The plan half of AI picks, for Clipper's cutting bench: the same
+    transcript load and the same `_select_clip_windows_with_retries` the
+    extract job runs, stopping before a single frame is encoded. The windows
+    come back in `output_json` so the bench can draw them on the timeline as
+    proposals the user nudges, deletes or accepts.
+
+    Whisper may still have to run here (a source with no cached transcript),
+    which is why this is a Job and not a request handler — it is local, free
+    and can take minutes.
+    """
+    max_clips = opts.max_clips
+    logger.info(
+        "TASK START suggest_clips | job=%s video=%s max=%d",
+        job_id[:8], downloaded_video_id[:8], max_clips,
+    )
+    from backend.agents.job_helper import update_job_status
+    from backend.database import AsyncSessionLocal
+    from backend.models.downloaded_video import DownloadedVideo
+    from backend.models.user_settings import UserSettings
+    from backend.services.clip_extractor import (
+        _load_or_transcribe_segments,
+        _raise_if_cancelled,
+        _remove_overlapping_clips,
+        _select_clip_windows_with_retries,
+    )
+    from sqlalchemy import select
+
+    try:
+        await update_job_status(job_id, "running", progress_pct=0,
+                                current_step="Loading video...")
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(DownloadedVideo).where(DownloadedVideo.id == downloaded_video_id)
+            )
+            video = result.scalar_one_or_none()
+            if not video:
+                raise ValueError(f"Downloaded video {downloaded_video_id} not found")
+            result = await db.execute(
+                select(UserSettings).where(UserSettings.user_id == user_id)
+            )
+            user_settings = result.scalar_one_or_none()
+
+        await update_job_status(job_id, "running", progress_pct=10,
+                                current_step="Reading the transcript...")
+        segments = await _load_or_transcribe_segments(
+            video,
+            user_settings,
+            whisper_quality=opts.whisper_quality,
+            force_retranscribe=opts.force_retranscribe,
+            job_id=job_id,
+            user_id=user_id,
+        )
+        if not segments:
+            raise ValueError(
+                "This video has no speech to analyse — drag your own ranges instead"
+            )
+
+        # Cancellation gates, same discipline as run_extract_clips: nothing
+        # interrupts this coroutine, so without them a cancel during the
+        # multi-minute Whisper phase let the runner carry on, make the
+        # selection call anyway, and then OVERWRITE the user's "cancelled"
+        # with "success" (terminal→terminal writes are deliberately allowed),
+        # so the bench adopted proposals the user had cancelled.
+        await _raise_if_cancelled(job_id)
+
+        await update_job_status(job_id, "running", progress_pct=55,
+                                current_step="Finding the strongest moments...")
+        duration = int(video.duration_seconds or 0)
+        windows = await _select_clip_windows_with_retries(
+            segments,
+            video.title or "Untitled",
+            duration,
+            max_clips,
+            user_settings,
+            min_duration=opts.min_duration,
+            max_duration=opts.max_duration,
+            job_id=job_id,
+            user_id=user_id,
+            user_query=opts.user_query,
+            target_platform=opts.target_platform,
+            genre=opts.genre,
+        )
+        # Sanitize BEFORE anything compares these numbers. The windows come
+        # straight from an LLM, and a NaN bound would reach the bench as a
+        # block of undefined width.
+        clean = []
+        for w in windows or []:
+            if not isinstance(w, dict):
+                continue
+            try:
+                start = float(w.get("start"))
+                end = float(w.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if not (start >= 0 and end > start):
+                continue
+            clean.append({**w, "start": start, "end": end})
+
+        clean = _remove_overlapping_clips(clean)
+        if not clean:
+            raise ValueError(
+                "The AI found no clip-worthy moments in this video — "
+                "try a wider length range, or drag your own"
+            )
+
+        # Trim to the shape the bench needs. The full window carries the
+        # scoring internals; the timeline only draws a span and a reason.
+        suggestions = [{
+            "start": round(w["start"], 3),
+            "end": round(w["end"], 3),
+            "title": (w.get("title") or "").strip() or None,
+            "score": w.get("virality_score"),
+            "hook_score": w.get("hook_score"),
+            "hook_type": w.get("hook_type"),
+            "reason": (w.get("reason") or w.get("reasoning") or "").strip() or None,
+        } for w in clean[:max_clips]]
+        suggestions.sort(key=lambda s: s["start"])
+
+        # Second gate: the selection call is the long pole after Whisper.
+        await _raise_if_cancelled(job_id)
+
+        await update_job_status(
+            job_id, "success", progress_pct=100,
+            current_step=f"Found {len(suggestions)} moment(s)",
+            output_data={"type": "clip_suggestions",
+                         "downloaded_video_id": downloaded_video_id,
+                         "suggestions": suggestions},
+        )
+        logger.info("TASK DONE suggest_clips | job=%s found=%d",
+                    job_id[:8], len(suggestions))
+    except asyncio.CancelledError:
+        logger.info("TASK CANCELLED suggest_clips | job=%s", job_id[:8])
+        raise
+    except Exception as e:
+        from backend.core.exceptions import JobCancelledError
+        if isinstance(e, JobCancelledError):
+            # Quiet stop, not a failure — mirrors run_extract_clips.
+            logger.info("TASK CANCELLED suggest_clips | job=%s (user cancel honoured)", job_id[:8])
+            await update_job_status(job_id, "cancelled", current_step="Cancelled")
+            return
+        logger.error("TASK FAILED suggest_clips | job=%s: %s", job_id[:8], e, exc_info=True)
+        await update_job_status(job_id, "failed", error_message=str(e))
+
+
 async def run_extract_clips(
     job_id: str,
     downloaded_video_id: str,
-    max_clips: int = 3,
-    caption_style: str = "viral",
-    whisper_quality: str = "balanced",
-    force_retranscribe: bool = False,
-    min_duration: int = None,
-    max_duration: int = None,
+    opts: ExtractOptions,
     user_id: str = "local",
 ):
-    """Extract viral clips from a downloaded video."""
-    logger.info("TASK START extract_clips | job=%s video=%s max=%d", job_id[:8], downloaded_video_id[:8], max_clips)
+    """Extract clips from a downloaded video — AI viral picker or manual ranges.
+
+    All run knobs come via `opts` (ExtractOptions). `opts.mode` is "ai"
+    (default — AI viral-clip picker) or "manual" (cut user-supplied
+    `opts.time_ranges` verbatim). The API endpoint validates `time_ranges`
+    before dispatching so the runner just forwards `opts` to
+    `extract_viral_clips`.
+    """
+    max_clips = opts.max_clips
+    mode = opts.mode
+    logger.info(
+        "TASK START extract_clips | job=%s video=%s mode=%s max=%d",
+        job_id[:8], downloaded_video_id[:8], mode, max_clips,
+    )
     from backend.agents.job_helper import update_job_status
     from backend.core.ws_manager import ws_manager
     from backend.database import AsyncSessionLocal
@@ -825,34 +1194,123 @@ async def run_extract_clips(
             )
             user_settings = result.scalar_one_or_none()
 
-        # Run the clip extraction pipeline
+        # Run the clip extraction pipeline. `opts.mode` + `opts.time_ranges`
+        # branch the service-layer logic: "ai" runs the viral picker,
+        # "manual" cuts the user-supplied ranges verbatim.
         clips = await extract_viral_clips(
             video=video,
             user_settings=user_settings,
-            max_clips=max_clips,
-            caption_style=caption_style,
-            whisper_quality=whisper_quality,
-            force_retranscribe=force_retranscribe,
+            opts=opts,
             job_id=job_id,
             user_id=user_id,
-            min_duration=min_duration,
-            max_duration=max_duration,
         )
 
         if not clips:
             raise ValueError("No clips were extracted")
 
+        # Final cancellation gate — the pipeline polls at its phase
+        # boundaries, but a cancel that lands DURING the ffmpeg fan-out is
+        # only visible here, after the files exist. Caught before the save
+        # loop so a cancelled job leaves no Library rows and the produced
+        # files don't orphan in GENERATED_DIR.
+        from backend.agents.job_helper import job_cancelled
+        from backend.core.exceptions import JobCancelledError
+        if await job_cancelled(job_id):
+            for clip in clips:
+                for key in ("video_path", "thumbnail_path"):
+                    p = clip.get(key)
+                    if p:
+                        try:
+                            Path(p).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            raise JobCancelledError("Job was cancelled by the user")
+
+        # Source video title — used as the prefix for per-clip names so users
+        # (and LLMs) can tell at a glance which source a clip came from.
+        # Truncated to ~30 chars to keep the per-clip title short.
+        source_title = (video.title if video and video.title else "Clip").strip()
+        if len(source_title) > 30:
+            source_title = source_title[:28].rstrip() + "…"
+
+        def _clip_title(c: dict, idx: int) -> str:
+            """Build a per-clip descriptive title.
+
+            All clips from the same source used to inherit the source's title
+            verbatim — five clips of "Tesla Q4 earnings call" all named the
+            same, useless when browsing or when an LLM is picking one via the
+            /mcp list_clips query.
+
+            Format priorities:
+              1. youtube_title  — when AI metadata succeeded, this is already
+                 a per-clip catchy title; prefer it.
+              2. {source} — {hook_type}: {reason} — derived from the
+                 viral-clip picker's structured fields.
+              3. {source} — clip {n} — fallback when neither AI metadata nor
+                 a reason landed.
+            """
+            yt = (c.get("youtube_title") or "").strip()
+            if yt:
+                return yt[:100]
+            hook = (c.get("hook_type") or "").strip()
+            reason = (c.get("reason") or "").strip()
+            if reason:
+                if len(reason) > 50:
+                    cut = reason[:48].rsplit(" ", 1)[0]
+                    reason = cut.rstrip(",.;:") + "…"
+                if hook:
+                    return f"{source_title} — {hook}: {reason}"
+                return f"{source_title} — {reason}"
+            return f"{source_title} — clip {idx + 1}"
+
+        # A clip whose parallel probe failed reaches here with aspect None
+        # (see _probe_one) — re-probe the finished file once rather than
+        # guessing 9:16, so the Library tile and the player frame stay honest.
+        from backend.services.video_utils import aspect_label
+
+        async def _fallback_aspect(c: dict) -> str:
+            path = c.get("video_path")
+            if path:
+                try:
+                    return await asyncio.to_thread(aspect_label, Path(path))
+                except Exception:
+                    pass
+            return "9:16"
+
+        # Resolve every missing aspect BEFORE the write transaction opens.
+        #
+        # This used to be `await _fallback_aspect(clip)` inline in the save loop
+        # below — a 15-second ffprobe subprocess awaited while the session
+        # already held SQLite's write lock from the previous row's flush().
+        # busy_timeout is 5s, so every other writer in the process (another
+        # job's status update, a download saving its row) got "database is
+        # locked" while a big extract saved. The window opened exactly when it
+        # was most likely to matter: this fallback only runs when the parallel
+        # probe already failed, and the documented cause of that is machine
+        # load. Sequential on purpose — same cost as before, just outside the
+        # lock.
+        resolved_aspects: dict[int, str] = {}
+        for _idx, _clip in enumerate(clips):
+            if not _clip.get("aspect_ratio"):
+                resolved_aspects[_idx] = await _fallback_aspect(_clip)
+
         # Save each clip as a GeneratedVideo record with all new fields
         clip_ids = []
         async with AsyncSessionLocal() as db:
-            for clip in clips:
+            for idx, clip in enumerate(clips):
                 gv = GeneratedVideo(
                     user_id=user_id,
                     source_downloaded_video_id=downloaded_video_id,
-                    title=clip.get("title", "Clip"),
+                    title=_clip_title(clip, idx),
                     video_path=str(clip["video_path"]) if clip.get("video_path") else None,
                     thumbnail_path=str(clip["thumbnail_path"]) if clip.get("thumbnail_path") else None,
-                    aspect_ratio="9:16",
+                    # Probed from the finished file by the extractor, NOT
+                    # assumed: extraction only reframes a landscape source, so
+                    # a square / 4:5 source keeps its own shape and used to be
+                    # persisted as "9:16" — which is what the Library sizes the
+                    # tile from and what the aspect filter chips match on.
+                    aspect_ratio=clip.get("aspect_ratio")
+                    or resolved_aspects.get(idx, "9:16"),
                     duration_seconds=clip.get("duration_seconds"),
                     gen_tier="clip_extraction",
                     source_type="clip_extraction",
@@ -865,9 +1323,20 @@ async def run_extract_clips(
                     clip_start_seconds=clip.get("start"),
                     clip_end_seconds=clip.get("end"),
                     clip_virality_score=clip.get("virality_score"),
+                    clip_hook_score=clip.get("hook_score"),
+                    clip_hook_type=clip.get("hook_type"),
                     clip_virality_reason=clip.get("reason"),
+                    # score_breakdown is the dict produced by _select_clip_windows
+                    # with the 4 sub-scores (flow / value / trend / shareability).
+                    # Serialize only when non-empty so legacy rows / fallback paths
+                    # that don't compute it stay NULL.
+                    clip_score_breakdown_json=(
+                        json.dumps(clip["score_breakdown"])
+                        if clip.get("score_breakdown") else None
+                    ),
                     caption_status=clip.get("caption_status"),
                     metadata_status=clip.get("metadata_status"),
+                    clip_selection=clip.get("selection"),
                     script=clip.get("transcript_text"),  # Store clip transcript as script
                 )
                 db.add(gv)
@@ -875,11 +1344,37 @@ async def run_extract_clips(
                 clip_ids.append(gv.id)
             await db.commit()
 
+        # Tell the USER, not just the log, when a caption burn failed. The job
+        # still reports success — the clips exist and play — and the rows still
+        # save as "ready", so before this the only trace of a failed burn was a
+        # log line: a customer found out by watching the files (rule #14).
+        uncaptioned = sum(
+            1 for c in clips
+            if c.get("caption_status") in ("failed", "extract_failed")
+        )
+        if uncaptioned > 0:
+            await ws_manager.send_constraint_warning(
+                "clip_captions_failed",
+                f"{uncaptioned} of {len(clips)} clips were saved WITHOUT captions "
+                f"— the caption burn failed. The ffmpeg error is in the backend log.",
+                severity="warning",
+                user_id=user_id,
+            )
+
+        # The picker-fallback count is the only trace that SURVIVES: the
+        # progress string that announced it is overwritten by the next phase
+        # seconds later, and a socket warning never reaches a REST client.
+        fallback_count = sum(1 for c in clips if c.get("selection") == "duration_fallback")
+        output_data = {"clip_ids": clip_ids, "count": len(clips)}
+        if fallback_count:
+            output_data["picker_fallback"] = True
+            output_data["fallback_count"] = fallback_count
+
         await update_job_status(
             job_id, "success",
             progress_pct=100,
             current_step=f"Extracted {len(clips)} clips",
-            output_data={"clip_ids": clip_ids, "count": len(clips)},
+            output_data=output_data,
         )
         await ws_manager.send({
             "type": "job_complete",
@@ -889,6 +1384,18 @@ async def run_extract_clips(
         logger.info("TASK DONE  extract_clips | job=%s clips=%d", job_id[:8], len(clips))
 
     except Exception as e:
+        # User-initiated cancel is a quiet stop, not a failure: the row is
+        # already "cancelled" (and must stay that way — a "failed" write here
+        # would overwrite it, terminal→terminal is allowed), and the user gets
+        # no job_failed toast for something they did on purpose. The import is
+        # local because the happy path above already imported it; re-importing
+        # is free.
+        from backend.core.exceptions import JobCancelledError
+        if isinstance(e, JobCancelledError):
+            logger.info("TASK CANCELLED extract_clips | job=%s (user cancel honoured)", job_id[:8])
+            from backend.agents.job_helper import update_job_status as _update
+            await _update(job_id, "cancelled", current_step="Cancelled")
+            return
         logger.error(f"TASK FAIL  extract_clips | job={job_id[:8]}: {e}", exc_info=True)
         from backend.agents.job_helper import update_job_status as _update
         await _update(job_id, "failed", error_message=str(e))
@@ -937,11 +1444,59 @@ async def run_upload(
 _task_semaphore = asyncio.Semaphore(3)  # max 3 concurrent heavy tasks
 
 
+# Job ids whose runner coroutine is executing RIGHT NOW in this process.
+# `Job.status` cannot answer "is work still happening?": a cancel flips the row
+# to the terminal "cancelled" at once, while the runner keeps going until the
+# in-flight step (a yt-dlp transfer, an ffmpeg pass) returns. Clients told to
+# "wait before starting a replacement" need a signal that actually ends when
+# the work does — this is it (surfaced as `runner_active` on GET /api/jobs/{id}).
+_active_runners: set[str] = set()
+
+
+def runner_active(job_id: str | None) -> bool:
+    """True while `job_id`'s runner is still executing in this process."""
+    return bool(job_id) and job_id in _active_runners
+
+
+def _job_id_of(coro) -> str | None:
+    """The `job_id` argument of a not-yet-started runner coroutine.
+
+    Every job runner takes `job_id` as a parameter, and an unstarted
+    coroutine's frame already holds its bound arguments — so the dispatch
+    wrapper can gate and track jobs without changing every dispatch call
+    site. Anything unexpected yields None, which only disables the gate.
+    """
+    try:
+        value = coro.cr_frame.f_locals.get("job_id")
+    except Exception:  # noqa: BLE001
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 async def _run_with_limit(coro):
-    """Run a coroutine with concurrency limiting."""
+    """Run a coroutine with concurrency limiting.
+
+    A job cancelled while it QUEUED for a slot never starts: the cancel API
+    answers `best_effort: false` ("cancelled before it started") for a pending
+    job, and before this gate that was untrue — the queued runner still ran
+    the whole download / ffmpeg pass once a slot came free.
+    """
+    job_id = _job_id_of(coro)
     try:
         async with _task_semaphore:
-            await coro
+            if job_id:
+                from backend.agents.job_helper import job_cancelled
+                if await job_cancelled(job_id):
+                    coro.close()   # never started — nothing to unwind
+                    logger.info("TASK SKIPPED | job=%s was cancelled while queued",
+                                job_id[:8])
+                    return
+                _active_runners.add(job_id)
+            try:
+                await coro
+            finally:
+                if job_id:
+                    _active_runners.discard(job_id)
     except Exception as e:
         # Last-resort catch — individual task runners should handle their own errors,
         # but if something leaks through, log it instead of crashing silently.
@@ -1050,10 +1605,194 @@ async def run_news_save(
         await update_job_status(job_id, "failed", error_message=str(e))
 
 
+async def run_studio_author(job_id: str, brief: dict, user_id: str = "local", **kwargs):
+    """Author a composition with the user's own model and set it live.
+
+    The shape that matters is validate → repair → set live. A composition that
+    fails the render contract is handed its own errors and re-authored once; a
+    composition that fails twice is reported as failed rather than written over
+    whatever the user already had. Setting a broken file live would cost them
+    working work to gain nothing.
+    """
+    from backend.agents.job_helper import update_job_status, job_cancelled
+    from backend.core.ai_provider import get_ai_client
+    from backend.core.exceptions import JobCancelledError
+    from backend.core.ws_manager import ws_manager
+    from backend.services import composition_author as author
+    from backend.services.studio_service import StudioService
+
+    logger.info("TASK START studio-author | job=%s", job_id[:8])
+    try:
+        await update_job_status(job_id, "running", progress_pct=10,
+                                current_step="Designing the composition")
+        if await job_cancelled(job_id):
+            raise JobCancelledError("Compose cancelled before it started")
+
+        # BYOK: the composition is written by whichever provider and model the
+        # user configured, so quality tracks their choice rather than ours.
+        from sqlalchemy import select as _select
+        from backend.database import AsyncSessionLocal
+        from backend.models.user_settings import UserSettings
+        async with AsyncSessionLocal() as db:
+            row = await db.execute(
+                _select(UserSettings).where(UserSettings.user_id == user_id))
+            user_settings = row.scalar_one_or_none()
+        ai = get_ai_client(user_settings)
+
+        assets_dir = StudioService.project_dir() / "assets"
+        html = await author.author_composition(brief, ai)
+        issues = await StudioService._all_issues(html, assets_dir)
+
+        for attempt in range(author.MAX_REPAIR_PASSES):
+            if not issues:
+                break
+            if await job_cancelled(job_id):
+                raise JobCancelledError("Compose cancelled")
+            logger.info("studio-author | job=%s repairing %d issue(s)", job_id[:8], len(issues))
+            await update_job_status(job_id, "running", progress_pct=55,
+                                    current_step="Fixing what the renderer rejected")
+            html = await author.author_composition(
+                brief, ai, repair_error="\n".join(f"- {i}" for i in issues),
+                previous_html=html)
+            issues = await StudioService._all_issues(html, assets_dir)
+
+        if issues:
+            # Report the findings rather than a generic failure: they name the
+            # element and the fix, which is what makes a second attempt (with a
+            # different model, or a clearer brief) worth trying.
+            raise ValueError(
+                "The composition didn't satisfy the renderer:\n"
+                + "\n".join(f"- {i}" for i in issues[:6]))
+
+        await update_job_status(job_id, "running", progress_pct=90,
+                                current_step="Opening it in the studio")
+        result = await StudioService.import_composition(html)
+        await update_job_status(job_id, "success", progress_pct=100, current_step="Done",
+                                output_data={"file": result["file"],
+                                             "archived": result.get("archived")})
+        await ws_manager.send({
+            "type": "job_complete", "job_id": job_id, "job_type": "motion_compose",
+            "result": result,
+        }, user_id)
+        logger.info("TASK DONE  studio-author | job=%s", job_id[:8])
+    except Exception as e:
+        from backend.core.exceptions import JobCancelledError as _JC
+        from backend.agents.job_helper import update_job_status as _u
+        from backend.core.ws_manager import ws_manager as _ws
+        if isinstance(e, _JC):
+            logger.info("TASK CANCELLED studio-author | job=%s", job_id[:8])
+            await _u(job_id, "cancelled", current_step="Cancelled")
+            return
+        logger.error("TASK FAIL  studio-author | job=%s: %s", job_id[:8], e, exc_info=True)
+        await _u(job_id, "failed", error_message=str(e)[:500])
+        await _ws.send({"type": "job_failed", "job_id": job_id,
+                        "error": f"Compose failed: {str(e)[:200]}"}, user_id)
+
+
+async def run_studio_render(job_id: str, aspect_ratio: str = "9:16",
+                            title: str | None = None,
+                            supersample: bool | None = None, **kwargs):
+    """Render the live studio composition to MP4 and land it in the Library.
+
+    Holds the studio's author lock for the render itself: index.html is a
+    single mutable file, and a composition swapped in halfway through a render
+    produces a video that is half one piece and half another.
+    """
+    from uuid import uuid4
+    from pathlib import Path
+    from backend.agents.job_helper import create_job, update_job_status, job_cancelled
+    from backend.agents.generator_motion import MotionGeneratorAgent
+    from backend.config import settings
+    from backend.core.exceptions import JobCancelledError
+    from backend.core.ws_manager import ws_manager
+    from backend.services.motion_render_service import MotionRenderService
+    from backend.services.studio_service import StudioService
+    from backend.services.video_utils import probe_duration
+
+    logger.info("TASK START studio-render | job=%s aspect=%s", job_id[:8], aspect_ratio)
+    try:
+        await update_job_status(job_id, "running", progress_pct=15,
+                                current_step="Rendering the composition")
+        if await job_cancelled(job_id):
+            raise JobCancelledError("Render cancelled before it started")
+        out = settings.GENERATED_DIR / f"motion_{uuid4().hex[:12]}.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        async with StudioService._author_lock:
+            video = await MotionRenderService.render_project(
+                StudioService.project_dir(), aspect_ratio, out_path=out, keep=True,
+                supersample=supersample)
+        # A cancelled render must not land in the Library or overwrite
+        # "cancelled" with "success" — check again now that the slow part is
+        # done and before anything is persisted.
+        if await job_cancelled(job_id):
+            await asyncio.to_thread(Path(video).unlink, True)
+            raise JobCancelledError("Render cancelled — output discarded")
+        await update_job_status(job_id, "running", progress_pct=85,
+                                current_step="Saving to library")
+        dur = await asyncio.to_thread(probe_duration, video, 0.0)
+        thumb = await MotionGeneratorAgent._thumbnail(video)
+        gen_id = await MotionGeneratorAgent._save(
+            user_id="local", title=(title or "Motion composition")[:120], variables={},
+            niche=None, video_path=video, thumb_path=thumb, audio_path=None,
+            aspect_ratio=aspect_ratio,
+            duration_seconds=int(round(dur)) if dur else None,
+            script=None, caption_status=None)
+        await update_job_status(job_id, "success", progress_pct=100, current_step="Done",
+                                output_data={"generated_video_id": gen_id,
+                                             "source_type": "motion_graphics"})
+        # create_job announced job_started to every listener. Without a matching
+        # terminal broadcast the global active-jobs pill lingers until some
+        # unrelated fetch reconciles it.
+        await ws_manager.send({
+            "type": "job_complete", "job_id": job_id, "job_type": "motion_render",
+            "result": {"generated_video_id": gen_id, "source_type": "motion_graphics"},
+        }, "local")
+        logger.info("TASK DONE  studio-render | job=%s gen=%s", job_id[:8], gen_id[:8])
+    except Exception as e:
+        from backend.core.exceptions import JobCancelledError as _JC
+        from backend.agents.job_helper import update_job_status as _u
+        from backend.core.ws_manager import ws_manager as _ws
+        if isinstance(e, _JC):
+            logger.info("TASK CANCELLED studio-render | job=%s", job_id[:8])
+            await _u(job_id, "cancelled", current_step="Cancelled")
+            return
+        logger.error("TASK FAIL  studio-render | job=%s: %s", job_id[:8], e, exc_info=True)
+        await _u(job_id, "failed", error_message=str(e))
+        await _ws.send({"type": "job_failed", "job_id": job_id,
+                        "error": f"Motion render failed: {e}"}, "local")
+
+
 def dispatch(coro):
     """Fire-and-forget an async task with concurrency limiting (max 3 concurrent)."""
     logger.debug("Dispatching async task: %s", coro.__qualname__ if hasattr(coro, '__qualname__') else type(coro).__name__)
     asyncio.create_task(_run_with_limit(coro))
+
+
+# Strong references to long-lived fire-and-forget tasks. asyncio keeps only a
+# WEAK reference to tasks (`asyncio.all_tasks` is a WeakSet), so a bare
+# `asyncio.create_task(coro)` whose return value is discarded can be
+# garbage-collected mid-flight — silently killing the work with no completion
+# and no error. Anything that sleeps between passes is especially exposed.
+_background_tasks: set = set()
+
+
+def spawn_background(coro) -> asyncio.Task:
+    """Schedule *coro* as a fire-and-forget task, holding a STRONG reference to
+    it until it completes.
+
+    Use this instead of ``dispatch()`` for supervisory/long-lived coroutines:
+    ``dispatch`` runs its argument inside ``_task_semaphore`` (max 3), so a
+    long-lived watcher would permanently occupy a third of the heavy-task
+    capacity and starve real jobs. This helper is unlimited but is only for
+    cheap, mostly-sleeping work.
+
+    Precondition: a running event loop (same as ``asyncio.create_task``).
+    Returns the Task so callers can await/cancel it if they need to.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 async def run_batch_generate(

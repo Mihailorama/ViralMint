@@ -27,6 +27,11 @@ import LabelOutlinedIcon from "@mui/icons-material/LabelOutlined"
 import FormatListNumberedIcon from "@mui/icons-material/FormatListNumbered"
 import ContentCutOutlinedIcon from "@mui/icons-material/ContentCutOutlined"
 import ZoomInMapOutlinedIcon from "@mui/icons-material/ZoomInMapOutlined"
+import CompressOutlinedIcon from "@mui/icons-material/CompressOutlined"
+import CropOutlinedIcon from "@mui/icons-material/CropOutlined"
+import VolumeOffOutlinedIcon from "@mui/icons-material/VolumeOffOutlined"
+import DownloadForOfflineOutlinedIcon from "@mui/icons-material/DownloadForOfflineOutlined"
+import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined"
 
 // ── Catalog ────────────────────────────────────────────────────────────────
 //
@@ -37,6 +42,13 @@ import ZoomInMapOutlinedIcon from "@mui/icons-material/ZoomInMapOutlined"
 
 const TOOLS = [
   // Video — visual / structural edits
+  {
+    id: "video-download",
+    title: "Video Download",
+    description: "Paste a link and pull the video down — pick the quality, keep or embed subtitles.",
+    icon: <DownloadForOfflineOutlinedIcon />,
+    category: "video",
+  },
   {
     id: "merge-clips",
     title: "Merge Clips",
@@ -49,6 +61,30 @@ const TOOLS = [
     title: "Transform",
     description: "Flip, rotate, loop, or change a clip's volume.",
     icon: <TransformIcon />,
+    category: "video",
+  },
+  {
+    // One runner, one job type, one history — but its own card, because
+    // "remove audio" is what people search for, not "transform".
+    id: "remove-audio",
+    title: "Remove Audio",
+    description: "Strip the sound from a video and keep the picture untouched.",
+    icon: <VolumeOffOutlinedIcon />,
+    category: "audio",
+    route: "/tools/transform?op=mute",
+  },
+  {
+    id: "compress",
+    title: "Compress Video",
+    description: "Shrink a file for email, chat, or an upload limit. Pick a size and a strength.",
+    icon: <CompressOutlinedIcon />,
+    category: "video",
+  },
+  {
+    id: "crop",
+    title: "Crop Video",
+    description: "Drag a box over the frame and keep just that part. Free-form or a fixed shape.",
+    icon: <CropOutlinedIcon />,
     category: "video",
   },
   {
@@ -137,6 +173,13 @@ const TOOLS = [
     title: "Export Subtitles",
     description: "Transcribe to a downloadable .srt / .vtt file or plain transcript.",
     icon: <ClosedCaptionOutlinedIcon />,
+    category: "subtitles",
+  },
+  {
+    id: "transcript",
+    title: "Transcript Downloader",
+    description: "Paste a link and grab the captions it already has as .txt / .srt / .vtt — no transcribing.",
+    icon: <ArticleOutlinedIcon />,
     category: "subtitles",
   },
   {
@@ -297,7 +340,10 @@ function CategorySection({ category, tools, onPick }) {
 export default function Tools() {
   useDocumentTitle("Tools")
   const navigate = useNavigate()
-  const pick = (id) => navigate(`/tools/${id}`)
+  const pick = (id) => {
+    const tool = TOOLS.find((t) => t.id === id)
+    navigate(tool?.route || `/tools/${id}`)
+  }
 
   // Hub search — a flat ranked result grid when a query is present, else the
   // categorized layout (title/description/id all match against the query).

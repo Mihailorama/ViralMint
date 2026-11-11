@@ -19,10 +19,18 @@ const useAppStore = create((set, get) => ({
   setMessages: (msgs) => set({ messages: msgs }),
   setStreaming: (v) => set({ isStreaming: v }),
   appendStreamToken: (token) => set((s) => ({ streamingText: s.streamingText + token })),
-  finalizeStream: (fullText) => {
+  // quickReplies is optional — when the planner emits a <quick_replies> block,
+  // the chips render below the just-finished assistant bubble. They live only
+  // in the in-memory message (not persisted), so they vanish on session reload
+  // (intended — the conversation has moved on).
+  finalizeStream: (fullText, quickReplies) => {
     const cleaned = fullText || get().streamingText
+    const msg = { role: "assistant", content: cleaned }
+    if (Array.isArray(quickReplies) && quickReplies.length > 0) {
+      msg.quickReplies = quickReplies
+    }
     set((s) => ({
-      messages: [...s.messages, { role: "assistant", content: cleaned }],
+      messages: [...s.messages, msg],
       streamingText: "",
       isStreaming: false,
     }))
@@ -56,9 +64,26 @@ const useAppStore = create((set, get) => ({
   activeWizard: null,
   setActiveWizard: (w) => set({ activeWizard: w }),
 
+  // Motion Graphics plugin opt-in state. Set by the Settings card and by the
+  // route gate, so the sidebar entry and the Tools card can reflect "installed"
+  // without each of them polling the same endpoint. `null` = not yet known,
+  // which is deliberately distinct from `false`: an entry that flashes
+  // "not installed" for one frame on every page load reads as broken.
+  motionInstalled: null,
+  setMotionInstalled: (v) => set({ motionInstalled: v }),
+
   // Jobs (polling from API — Dashboard uses this)
   jobs: [],
   setJobs: (j) => set({ jobs: j }),
+
+  // ── Activity panel ────────────────────────────────────────────────────────
+  // The job log lives in a panel any surface can open, because jobs start from
+  // Stock Video, a tool page, the Clipper and the Motion studio alike — it used
+  // to be a Library tab, reachable from exactly one route. The sidebar's
+  // running-jobs pill and the Library's Activity button both flip this.
+  activityOpen: false,
+  openActivity: () => set({ activityOpen: true }),
+  closeActivity: () => set({ activityOpen: false }),
 
   // Active jobs — real-time via WebSocket, persists across page nav
   // { [jobId]: { jobId, jobType, status, percent, step, message, startedAt } }

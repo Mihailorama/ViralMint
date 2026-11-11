@@ -10,6 +10,7 @@ Script -> Voice -> Transcribe -> Stock video -> Music Mix -> Captions -> Final o
 - Background music mixing
 - Falls back to Ken Burns image zoom or text-on-background when Pexels is unavailable
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -18,7 +19,7 @@ from sqlalchemy import select
 
 from backend.database import AsyncSessionLocal
 from backend.models.downloaded_video import DownloadedVideo
-from backend.models.generated_video import GeneratedVideo
+from backend.models.generated_video import GeneratedVideo, NICHE_MAX_CHARS
 from backend.models.scout_result import ScoutResult
 from backend.models.user_settings import UserSettings
 from backend.core.ai_provider import get_ai_client
@@ -26,6 +27,7 @@ from backend.core.ws_manager import ws_manager
 from backend.agents.job_helper import update_job_status
 from backend.config import settings
 from backend.core.exceptions import safe_json_loads
+from backend.core.prompt_rules import extract_json_text
 
 from backend.agents.generator_prompts import (
     PLATFORM_GUIDELINES, SCRIPT_PROMPT, YOUTUBE_META_PROMPT, TIKTOK_META_PROMPT,
@@ -33,6 +35,23 @@ from backend.agents.generator_prompts import (
 from backend.agents.generator_video import (
     generate_stock_video, generate_kenburns_video,
 )
+
+
+# Longest script the generator asks for. Shorts, whatever the source runs: a
+# 15-minute source used to ask for a 900-second script, which Claude obeys —
+# and then runs out of tokens mid-sentence.
+SCRIPT_MAX_SECONDS = 180
+
+
+def _script_seconds(estimated) -> int:
+    """The spoken length to ask the script writer for: the source's estimate,
+    capped at SCRIPT_MAX_SECONDS; 90 s when the estimate is missing or junk."""
+    try:
+        seconds = int(float(estimated))
+    except (TypeError, ValueError):
+        return 90
+    return max(15, min(seconds, SCRIPT_MAX_SECONDS)) if seconds > 0 else 90
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +72,9 @@ class GeneratorAgent:
         music_genre: str = None,
         custom_script: str = None,
         start_image: str = None,
+        user_images: list[str] = None,
+        visual_style: str = None,
+        transition_style: str = None,
         **_ignored,  # absorb deprecated kwargs (gen_tier, video_model, operation_type, etc.)
     ):
         """Full generation pipeline."""
@@ -117,12 +139,14 @@ class GeneratorAgent:
             segments = []
             if voice_path and opts["caption_enabled"]:
                 await ws_manager.send_progress(job_id, 25, "Extracting word timestamps...", user_id)
-                segments = await self._transcribe_for_captions(voice_path)
+                segments = await self._transcribe_for_captions(voice_path, script=script)
 
             # Generate video clips (stock footage / kenburns / text fallback)
             await ws_manager.send_progress(job_id, 35, "Generating video (stock footage)...", user_id)
             video_path = await self._generate_video(
                 script, voice_path, aspect_ratio, user_settings, start_image=start_image,
+                visual_style=visual_style, transition_style=transition_style,
+                user_images=user_images,
             )
 
             if not video_path:
@@ -166,11 +190,29 @@ class GeneratorAgent:
 
             # Step 7: Burn animated captions (75%)
             if segments and opts["caption_enabled"]:
+                # burn_captions returns its INPUT on failure (missing libass, an
+                # ffmpeg error, a zero-byte write) — so an unchanged path IS the
+                # failure signal. The video still ships, but the user asked for
+                # captions, so the least this owes them is to say they are
+                # missing (rule #14) instead of leaving it in a log file.
+                before_captions = str(video_path)
                 try:
                     await ws_manager.send_progress(job_id, 75, f"Burning {opts['caption_style']} captions...", user_id)
                     video_path = await self._burn_captions(video_path, segments, aspect_ratio, opts)
+                    if str(video_path) == before_captions:
+                        await ws_manager.send_constraint_warning(
+                            "captions_failed",
+                            "Captions could not be burned — the video was saved WITHOUT "
+                            "captions (the ffmpeg error is in the backend log).",
+                            severity="warning", user_id=user_id,
+                        )
                 except Exception as e:
                     logger.warning(f"Caption burn failed, saving video without captions: {e}")
+                    await ws_manager.send_constraint_warning(
+                        "captions_failed",
+                        f"Captions could not be burned — the video was saved WITHOUT captions ({str(e)[:160]}).",
+                        severity="warning", user_id=user_id,
+                    )
 
             # Step 7b: Apply auto-zoom on highlighted words (80%)
             if segments and opts.get("auto_zoom_enabled", False):
@@ -187,18 +229,30 @@ class GeneratorAgent:
                         )
                 except Exception as e:
                     logger.warning(f"Auto-zoom failed, saving video without zoom: {e}")
+                    await ws_manager.send_constraint_warning(
+                        "auto_zoom_failed",
+                        f"Auto-zoom failed — the video was saved without zoom pulses ({str(e)[:160]}).",
+                        severity="warning", user_id=user_id,
+                    )
 
             # Step 8: Generate metadata (85%)
             metadata = {"youtube": {}, "tiktok": {}}
             try:
                 await ws_manager.send_progress(job_id, 85, "Generating metadata...", user_id)
-                niche = (safe_json_loads(source.insights_json, {}, logger).get("topic_angle", "") if source and source.insights_json else "")
-                metadata = await self._generate_metadata(script, niche, user_settings)
+                # `topic_angle` is PROSE by design — the analyzer prompt asks
+                # "what makes this specific angle work", so it comes back as a
+                # full sentence. Good context for the metadata prompt...
+                angle = (safe_json_loads(source.insights_json, {}, logger).get("topic_angle", "") if source and source.insights_json else "")
+                metadata = await self._generate_metadata(script, angle, user_settings)
                 if not metadata or not isinstance(metadata, dict):
                     metadata = {"youtube": {}, "tiktok": {}}
             except Exception as e:
                 logger.warning(f"Metadata generation failed, using defaults: {e}")
-                niche = ""
+            # ...but it is NOT a niche. Storing it in GeneratedVideo.niche (a
+            # String(200) keyword column) put 250-450 char paragraphs in the
+            # column meant for a search phrase. Resolve a real short niche
+            # instead, or store nothing.
+            row_niche = await self._resolve_row_niche(source)
 
             # Step 9: Generate AI thumbnail (92%)
             thumb_path = None
@@ -222,7 +276,7 @@ class GeneratorAgent:
                     source_downloaded_video_id=downloaded_video_id,
                     title=metadata.get("youtube", {}).get("title", "Untitled"),
                     script=script,
-                    niche=niche,
+                    niche=row_niche,
                     video_path=str(video_path),
                     audio_path=str(voice_path) if voice_path else None,
                     thumbnail_path=str(thumb_path) if thumb_path else None,
@@ -280,7 +334,13 @@ class GeneratorAgent:
             user_settings.music_enabled if user_settings and user_settings.music_enabled is not None else True
         )
         mus_genre = music_genre or (user_settings.music_genre if user_settings else None) or "lofi"
-        mus_vol = user_settings.music_volume_db if user_settings and user_settings.music_volume_db else -20.0
+        mus_vol = user_settings.music_volume_db if user_settings and user_settings.music_volume_db else -14.0
+        # -20.0 is the legacy column default and no UI has ever written this
+        # field — a stored -20 is the old default, not a choice. It measured
+        # as inaudible (0.1dB mean-volume delta on a real render), which users
+        # reported as "no background music". Upgrade it to the audible bed.
+        if mus_vol == -20.0:
+            mus_vol = -14.0
 
         return {
             "tts_provider": tts_enum,
@@ -363,7 +423,10 @@ class GeneratorAgent:
             transcript_section=transcript_section,
             platform_guidelines=guidelines,
             search_demand_section=search_demand_section,
-            duration_seconds=insights.get("estimated_duration", 90),
+            # Shorts, whatever the source runs: a 15-minute source asked for a
+            # 900-second script, which Claude obeys and then runs out of
+            # tokens mid-sentence.
+            duration_seconds=_script_seconds(insights.get("estimated_duration")),
             aspect_ratio=aspect_ratio,
             platform_format=platform_format,
             tone=tone,
@@ -378,7 +441,8 @@ class GeneratorAgent:
         ai = get_ai_client(user_settings)
         script = await ai.chat(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
+            # A 180 s script in Chinese runs ~900 tokens; 1024 cut some off.
+            max_tokens=1500,
         )
         return script.strip()
 
@@ -406,6 +470,36 @@ class GeneratorAgent:
 
         logger.info(f"Script verified: {len(cleaned)} chars, first 80: {cleaned[:80]!r}")
         return cleaned
+
+    async def _resolve_row_niche(self, source) -> str | None:
+        """Resolve a SHORT niche keyword for GeneratedVideo.niche, or None.
+
+        Deliberately does NOT fall back to insights["topic_angle"] the way
+        `_get_search_demand_section` does: that field is a full sentence by
+        design, which is fine as prompt context but wrong for a keyword
+        column. Prefer a real niche, and store nothing rather than a paragraph.
+
+        Order: the source's own niche → the scout query that found it → None.
+        """
+        candidate = (getattr(source, "niche", None) or "").strip() if source else ""
+        if not candidate and source is not None and getattr(source, "scout_result_id", None):
+            try:
+                async with AsyncSessionLocal() as db:
+                    row = await db.execute(
+                        select(ScoutResult.niche).where(
+                            ScoutResult.id == source.scout_result_id)
+                    )
+                    candidate = (row.scalar_one_or_none() or "").strip()
+            except Exception:
+                logger.debug("Could not read scout niche for the generated row",
+                             exc_info=True)
+        if not candidate:
+            return None
+        if len(candidate) > NICHE_MAX_CHARS:
+            logger.info("Discarding a %d-char 'niche' — too long to be a keyword: %r",
+                        len(candidate), candidate[:80])
+            return None
+        return candidate
 
     async def _get_search_demand_section(self, source, insights: dict) -> str:
         """Fetch YouTube search demand data for the video's niche and format for prompt injection."""
@@ -456,9 +550,29 @@ class GeneratorAgent:
             if not voice:
                 voice = "en-US-AndrewMultilingualNeural"
 
+        async def _warn_voice_swap(why: str):
+            # A render that speaks in a DIFFERENT voice than the one the user
+            # picked must never be silent about it — "the dropdown said X but
+            # the video is someone else" destroys trust in every setting on
+            # the page. Same rule as everywhere: degrade loudly.
+            try:
+                from backend.core.ws_manager import ws_manager
+                await ws_manager.send_constraint_warning(
+                    constraint="tts_fallback",
+                    severity="warning",
+                    message=(
+                        f"Your selected voice ({opts['tts_label']}) wasn't "
+                        f"available — {why} The video was narrated with the "
+                        f"free Edge voice instead."
+                    ),
+                )
+            except Exception as ws_exc:
+                logger.warning(f"tts_fallback WS emit failed: {ws_exc}")
+
         # Fall back to free Edge TTS if a paid provider is selected without a key
         if provider != TTSProvider.EDGE_TTS and not api_key:
             logger.warning(f"{opts['tts_label']} key missing — falling back to Edge TTS (free)")
+            await _warn_voice_swap("add its API key in Settings to use it.")
             provider = TTSProvider.EDGE_TTS
             voice = voice or "en-US-AndrewMultilingualNeural"
             api_key = ""
@@ -470,41 +584,85 @@ class GeneratorAgent:
         except Exception as e:
             if provider != TTSProvider.EDGE_TTS:
                 logger.warning(f"TTS failed with {provider}, falling back to Edge TTS: {e}")
+                await _warn_voice_swap("it failed while generating.")
                 return await generate_tts(text=script, provider=TTSProvider.EDGE_TTS, voice_id="en-US-AndrewMultilingualNeural")
             raise
 
     # ── Transcription ───────────────────────────────────────────────────
 
-    async def _transcribe_for_captions(self, voice_path: Path) -> list[dict]:
-        """Transcribe the generated voice audio to get word-level timestamps."""
+    async def _transcribe_for_captions(self, voice_path: Path, script: str | None = None) -> list[dict]:
+        """Transcribe the generated voice audio to get word-level timestamps.
+
+        Whisper is used for TIMING ONLY — when the narration `script` is known,
+        its true text is aligned onto the timed words so CJK captions never
+        display ASR homophone errors (崇祯→重真, 勤政→情政 burned into a real
+        render's captions). Fail-open: no script or non-CJK → unchanged."""
         try:
             from backend.services.whisper_service import whisper_service
-            whisper_service.load("fast")
-            result = await whisper_service.transcribe(voice_path, language=None)
-            return result.get("segments", [])
+            # "fast" (base) is enough for caption timing on our own clean TTS
+            # output, and quality is passed EXPLICITLY: transcribe() used to
+            # re-resolve the model itself and default back to "balanced",
+            # throwing away this pre-load and paying for a second one.
+            # Loaded in a thread because a first-time load downloads the model.
+            #
+            # Deliberately NOT timing_only=True (greedy + VAD): the recognised
+            # text is only replaced by the real script when that script is
+            # CJK-dominant (see caption_service.align_script_to_segments), so
+            # for a Latin script the ASR text IS what gets burned in — a
+            # cheaper decode would degrade the visible captions, not just the
+            # discarded text.
+            await asyncio.to_thread(whisper_service.load, "fast")
+            # No job_id in scope here, so the DEFAULT on_download applies: a
+            # constraint-warning toast. That is the point of making the toast the
+            # default — a caller that cannot name a progress bar still says
+            # something rather than nothing.
+            result = await whisper_service.transcribe(
+                voice_path, language=None, quality="fast")
+            segments = result.get("segments", [])
+            if script:
+                from backend.services.caption_service import align_script_to_segments
+                segments = align_script_to_segments(script, segments)
+            return segments
         except Exception as e:
             logger.warning(f"Voice transcription for captions failed: {e}")
             return []
 
     # ── Video generation ────────────────────────────────────────────────
 
-    async def _generate_video(self, script: str, voice_path: Path, aspect_ratio: str, user_settings, start_image: str = None) -> Path:
-        """Generate video: Pexels stock footage → Ken Burns image → text fallback."""
+    async def _generate_video(self, script: str, voice_path: Path, aspect_ratio: str, user_settings, start_image: str = None, visual_style: str = None, transition_style: str = None, user_images: list[str] = None) -> Path:
+        """Generate video: Pexels stock footage → Ken Burns image → text fallback.
+
+        `start_image` and `user_images` are two different asks and only one
+        can win. A start image means "make the WHOLE video out of this one
+        picture"; user images mean "put these into the scenes of a normal
+        stock video". Where both arrive, the per-scene ask is the one that
+        keeps the script's structure, so it takes precedence.
+        """
         result = None
 
-        # Ken Burns from start image (if provided)
-        if start_image:
+        # Ken Burns from start image (if provided, and not superseded)
+        if start_image and not user_images:
             try:
                 result = await generate_kenburns_video(start_image, voice_path, aspect_ratio)
             except Exception as e:
                 logger.warning(f"Ken Burns video generation failed: {e}")
 
-        # Pexels stock footage
+        # Pexels stock footage, with the user's own images filling scenes
         if not result:
             try:
-                result = await generate_stock_video(script, voice_path, aspect_ratio, user_settings)
+                result = await generate_stock_video(script, voice_path, aspect_ratio, user_settings, visual_style=visual_style, transition_style=transition_style, user_images=user_images)
             except Exception as e:
                 logger.warning(f"Stock video generation failed: {e}")
+
+        # A start image that was superseded above is still better than the
+        # text fallback below. This rung matters when every per-scene image
+        # turned out to be unusable — the user offered two pictures and we
+        # should not end up showing them neither.
+        if not result and start_image:
+            try:
+                result = await generate_kenburns_video(start_image, voice_path, aspect_ratio)
+            except Exception as e:
+                logger.warning(f"Ken Burns fallback failed: {e}")
 
         # Text-on-background fallback
         if not result:
@@ -524,10 +682,26 @@ class GeneratorAgent:
         if not music_path:
             return voice_path
 
+        # select_music matches genre by filename glob; when nothing in the
+        # library matches it silently falls back to ANY track — the user
+        # picked "lofi" and got an upbeat sample with no signal that anything
+        # had been substituted. Degrade loudly, never silently.
+        if opts["music_genre"].lower() not in music_path.name.lower():
+            from backend.core.ws_manager import ws_manager
+            await ws_manager.send_constraint_warning(
+                constraint="music_genre_fallback",
+                message=(
+                    f"No {opts['music_genre']} track in your Music Library — "
+                    f"using '{music_path.stem}' instead. Add tracks on the "
+                    f"Music page to get the genre you picked."
+                ),
+                severity="info",
+            )
+
         return await mix_audio(
             voice_path=voice_path,
             music_path=music_path,
-            music_volume_db=opts.get("music_volume_db", -20.0),
+            music_volume_db=opts.get("music_volume_db", -14.0),
         )
 
     @staticmethod
@@ -545,7 +719,14 @@ class GeneratorAgent:
             aspect_ratio=aspect_ratio,
             emoji_style=opts.get("caption_emoji_style", "moderate"),
         )
-        return await burn_captions(video_path, ass_path)
+        result = await burn_captions(video_path, ass_path)
+        # Clean up the actual temp ASS file returned by generate_captions_ass
+        # (Wave-1 writes captions_{uuid}.ass, not a fixed name).
+        try:
+            ass_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return result
 
     async def _generate_metadata(self, script: str, niche: str, user_settings) -> dict:
         """Generate YouTube + TikTok metadata via AI."""
@@ -574,8 +755,10 @@ class GeneratorAgent:
                 script_preview=script_preview, niche=niche,
                 search_demand_section=search_demand_section,
             )
-            yt_resp = await ai.chat(messages=[{"role": "user", "content": yt_prompt}], max_tokens=512)
-            yt_clean = yt_resp.strip()
+            # A 200-400-word description + 15 tags: 512 tokens cut the JSON off
+            # mid-description on Claude, and the metadata was lost.
+            yt_resp = await ai.chat(messages=[{"role": "user", "content": yt_prompt}], max_tokens=1200)
+            yt_clean = extract_json_text(yt_resp)  # fence anywhere / leading prose (prompt_rules)
             if yt_clean.startswith("```"):
                 yt_clean = yt_clean.split("\n", 1)[1].rsplit("```", 1)[0]
             try:
@@ -595,8 +778,8 @@ class GeneratorAgent:
                 script_preview=script_preview, niche=niche,
                 search_demand_section=search_demand_section,
             )
-            tt_resp = await ai.chat(messages=[{"role": "user", "content": tt_prompt}], max_tokens=256)
-            tt_clean = tt_resp.strip()
+            tt_resp = await ai.chat(messages=[{"role": "user", "content": tt_prompt}], max_tokens=600)
+            tt_clean = extract_json_text(tt_resp)  # fence anywhere / leading prose (prompt_rules)
             if tt_clean.startswith("```"):
                 tt_clean = tt_clean.split("\n", 1)[1].rsplit("```", 1)[0]
             try:

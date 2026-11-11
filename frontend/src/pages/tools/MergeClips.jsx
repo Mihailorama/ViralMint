@@ -15,6 +15,7 @@ import ArrowBackIcon from "@mui/icons-material/ArrowBack"
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator"
 import WarningAmberIcon from "@mui/icons-material/WarningAmber"
 import http from "../../api/http"
+import { toolJobTypeFor } from "../../components/tools/toolJobType"
 import useAppStore from "../../store/appStore"
 import useDocumentTitle from "../../hooks/useDocumentTitle"
 
@@ -203,7 +204,7 @@ export default function ToolMergeClips() {
         headers: { "Content-Type": "multipart/form-data" },
         timeout: 300000,
       })
-      startJob(data.job_id, "tool", "Starting...")
+      startJob(data.job_id, toolJobTypeFor("/api/tools/merge-clips"), "Starting...")
       setJobId(data.job_id)
     } catch (e) {
       const msg = e?.response?.data?.detail || e.message || "Upload failed"
@@ -557,7 +558,7 @@ export default function ToolMergeClips() {
         open={!!previewClip}
         onClose={() => setPreviewClip(null)}
         maxWidth="md"
-        PaperProps={{ sx: { bgcolor: "#000" } }}
+        slotProps={{ paper: { sx: { bgcolor: "#000" } } }}
       >
         <DialogContent sx={{ p: 0, position: "relative" }}>
           {previewClip && (

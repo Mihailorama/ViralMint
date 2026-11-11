@@ -1,4 +1,4 @@
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 import { ws } from "../api/websocket"
 import http from "../api/http"
 import useAppStore from "../store/appStore"
@@ -22,17 +22,29 @@ export default function useWebSocket() {
     removeJob,
   } = useAppStore()
 
+  // Chat tokens arrive far faster than the screen refreshes. Writing each one
+  // straight to the store cost a store notify + a markdown re-parse of the
+  // WHOLE partial response per token — quadratic over a long answer, and the
+  // main thread felt it. Buffer instead and flush at most once per frame; the
+  // rendered result is identical because appendStreamToken is a string concat.
+  const tokenBufRef = useRef("")
+  const rafRef = useRef(null)
+  const streamOpenRef = useRef(false)
+
   useEffect(() => {
     ws.connect()
 
     // Restore running/pending jobs from API so active jobs survive page refresh
     const restoreJobs = async () => {
       try {
-        const [runningRes, pendingRes] = await Promise.all([
-          http.get("/api/jobs", { params: { status: "running", limit: 20 } }),
-          http.get("/api/jobs", { params: { status: "pending", limit: 20 } }),
-        ])
-        const allJobs = [...(runningRes.data.jobs || []), ...(pendingRes.data.jobs || [])]
+        // ONE request for both statuses (the endpoint takes a comma list).
+        // This used to be two, on a load that already fetches jobs twice more
+        // for the Activity panel. Limit is 40, not 20, because it now covers
+        // what were two separate 20-row windows.
+        const { data } = await http.get("/api/jobs", {
+          params: { status: "running,pending", limit: 40 },
+        })
+        const allJobs = data.jobs || []
         // Restore active jobs from API on reconnect
         allJobs.forEach(j => {
           if (!useAppStore.getState().activeJobs[j.id]) {
@@ -53,17 +65,75 @@ export default function useWebSocket() {
     }
     restoreJobs()
 
+    // Drain the token buffer into the store. Safe to call at any time; a no-op
+    // when empty. MUST be called synchronously before any handler that reads
+    // streamingText (finalizeStream falls back to it when full_response is
+    // missing) or clears it (chat_error) — otherwise a frame's worth of
+    // buffered tokens is dropped, or a pending frame writes text back AFTER the
+    // clear.
+    const flushTokens = () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current)
+        rafRef.current = null
+      }
+      const buf = tokenBufRef.current
+      if (!buf) return
+      tokenBufRef.current = ""
+      appendStreamToken(buf)
+    }
+
+    const endStream = () => {
+      flushTokens()
+      streamOpenRef.current = false
+    }
+
     const unsubs = [
       ws.on("chat_token", (msg) => {
-        setStreaming(true)
-        appendStreamToken(msg.token)
+        // Flip the composer lock once per turn, not once per token.
+        if (!streamOpenRef.current) {
+          streamOpenRef.current = true
+          setStreaming(true)
+        }
+        tokenBufRef.current += msg.token
+        if (rafRef.current == null) {
+          rafRef.current = requestAnimationFrame(() => {
+            rafRef.current = null
+            const buf = tokenBufRef.current
+            if (!buf) return
+            tokenBufRef.current = ""
+            appendStreamToken(buf)
+          })
+        }
       }),
 
       ws.on("chat_done", (msg) => {
-        finalizeStream(msg.full_response)
+        endStream()  // land buffered tokens before finalizeStream reads them
+        // quick_replies is an optional list emitted when the AI included a
+        // <quick_replies> block. Bundling it onto chat_done keeps the chips
+        // attached atomically to the message that just finished — no race
+        // where the bubble renders before its chips arrive.
+        finalizeStream(msg.full_response, msg.quick_replies)
+      }),
+
+      // Dispatch-time follow-up from the planner (a clarifying question, a
+      // no-op note) — sent AFTER chat_done. Render it as a normal assistant
+      // bubble with optional quick-reply chips. Crucially it does NOT call
+      // setStreaming: the old path emitted these as chat_token, which flipped
+      // isStreaming=true with no matching chat_done and locked the composer
+      // forever ("which platform?" → user can't answer). Not persisted here —
+      // the backend folds the text into the turn's assistant message.
+      ws.on("assistant_message", (msg) => {
+        const content = (msg.content || "").trim()
+        if (!content) return
+        const m = { role: "assistant", content }
+        if (Array.isArray(msg.quick_replies) && msg.quick_replies.length > 0) {
+          m.quickReplies = msg.quick_replies
+        }
+        addMessage(m)
       }),
 
       ws.on("chat_error", (msg) => {
+        endStream()
         setStreaming(false)
         clearStreamingText()
         addMessage({ role: "system", content: `Error: ${msg.error}` })
@@ -237,6 +307,12 @@ export default function useWebSocket() {
 
     return () => {
       unsubs.forEach(fn => fn())
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current)
+        rafRef.current = null
+      }
+      tokenBufRef.current = ""
+      streamOpenRef.current = false
     }
   }, [])
 }

@@ -94,18 +94,91 @@ async def update_job_status(
     current_step: str = None,
     error_message: str = None,
     output_data: dict = None,
+    _cas_retry: bool = True,
 ):
     """Update a job's status and optional fields."""
     from datetime import datetime
     import asyncio
     async with AsyncSessionLocal() as db:
-        from sqlalchemy import select
+        from sqlalchemy import select, update
         result = await db.execute(select(Job).where(Job.id == job_id))
         job = result.scalar_one_or_none()
         if not job:
             return
+        # Terminal-state guard. A finalised job (success/failed/cancelled) must
+        # never be reverted to "running" by a late progress update — this
+        # matters now that ws_manager.send_progress also writes the DB, so a
+        # stray progress event arriving after termination would otherwise
+        # resurrect the row (and hand the zombie sweep a fresh heartbeat on a
+        # job nobody is running). Updates AMONG terminal states are still
+        # allowed, which is what lets a mis-swept job self-heal: a draining
+        # predecessor's final "success" still lands over the sweep's "failed".
+        if job.status in _TERMINAL and status not in _TERMINAL:
+            return
+        # ...with ONE exception: a user's cancel must never become "success".
+        # Cancellation is cooperative (DELETE /api/jobs/{id} only flips the
+        # row), so a runner that polls `job_cancelled()` too late — or, as the
+        # download family did, not at all — reaches its unconditional terminal
+        # write and turns the user's "cancelled" back into "success", complete
+        # with a job_complete event and a completion notification. That is what
+        # made cancelling a download look like it had done nothing.
+        #
+        # Scoped deliberately narrow. failed→success still lands, because
+        # database.sweep_stale_jobs depends on exactly that to self-heal a
+        # mis-swept job whose draining predecessor later finishes. Only the
+        # transition that contradicts the user is refused. The per-runner
+        # polls remain the primary mechanism — they also stop the work — and
+        # this is the backstop for runners that forget.
+        if job.status == "cancelled" and status == "success":
+            logger.info(
+                "Refusing to overwrite cancelled job %s with success — "
+                "the user cancelled it (job_type=%s)", job_id[:8], job.job_type,
+            )
+            return
+        # cancelled + failed: BOTH are true, so both are kept. Cancellation is
+        # cooperative, so the in-flight step routinely fails minutes after the
+        # user cancels. The status stays the "cancelled" the user asked for,
+        # and the failure's reason is recorded in error_message — so the job
+        # never reads as clean, and never flips to a red "failed" for
+        # something the user already stopped. Enforced here once rather than
+        # in every runner's finalizer.
+        if job.status == "cancelled" and status == "failed":
+            status = "cancelled"
         prev_status = job.status
+        # Compare-and-swap the STATUS before anything else is written. The
+        # guards above read the status, and nothing held it: a cancel
+        # committing between that read and this write used to be overwritten
+        # by a runner's "success" (and vice versa in DELETE /api/jobs). The
+        # conditional UPDATE only lands if the row is still what we checked,
+        # and it takes SQLite's write lock for the rest of this transaction,
+        # so the ORM writes below cannot interleave with another writer. On a
+        # lost race, re-read once and let the guards judge the new status.
+        if status != prev_status:
+            swapped = await db.execute(
+                update(Job)
+                .where(Job.id == job_id, Job.status == prev_status)
+                .values(status=status)
+                .execution_options(synchronize_session=False)
+            )
+            if swapped.rowcount == 0:
+                await db.rollback()
+                if _cas_retry:
+                    return await update_job_status(
+                        job_id, status, progress_pct=progress_pct,
+                        current_step=current_step, error_message=error_message,
+                        output_data=output_data, _cas_retry=False,
+                    )
+                logger.info("Job %s status changed concurrently twice; "
+                            "dropping the %s write", job_id[:8], status)
+                return
         job.status = status
+        # Heartbeat: touch on EVERY accepted update, even when no other column
+        # changes (a progress tick rejected by the regression guard just below
+        # would otherwise produce no UPDATE at all, and `onupdate` would not
+        # fire). The boot-time sweep uses this to tell a job that is alive in a
+        # draining predecessor instance from one that died with the old
+        # process — see database.sweep_stale_jobs.
+        job.updated_at = datetime.utcnow()
         if progress_pct is not None:
             # Prevent progress regression (e.g. 95% → 50%) unless explicitly restarting
             is_restart = status == "running" and progress_pct == 0
@@ -131,3 +204,50 @@ async def update_job_status(
             asyncio.create_task(_record_job_behavior(
                 job.job_type, job.user_id, job.input_json, job.output_json,
             ))
+
+
+async def cancel_if_live(job_id: str) -> bool:
+    """Flip a job to "cancelled" ONLY if it is still pending/running.
+
+    One conditional UPDATE, so a job that finished a moment earlier keeps its
+    real terminal status instead of being rewritten as cancelled. Returns True
+    when this call cancelled it.
+    """
+    from sqlalchemy import update
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(
+            update(Job)
+            .where(Job.id == job_id, Job.status.in_(("running", "pending")))
+            .values(status="cancelled")
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        return res.rowcount > 0
+
+
+async def job_cancelled(job_id: str | None) -> bool:
+    """True when the job row has been flipped to "cancelled" by the user.
+
+    Cancellation (DELETE /api/jobs/{id} or the WS job_cancel message) only
+    updates the DB row — it never interrupts the running coroutine. Long
+    pipelines poll this at phase boundaries (after Whisper, after AI
+    selection, before the ffmpeg fan-out) and raise JobCancelledError so a
+    cancelled job stops burning CPU and its "cancelled" status isn't
+    overwritten by a late terminal write.
+
+    `None` / unknown ids return False — a pipeline invoked without a job
+    (direct service call, tests) must never think it was cancelled. DB errors
+    also return False: cancellation is best-effort, and a transient read
+    failure must not kill a healthy job.
+    """
+    if not job_id:
+        return False
+    try:
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import select
+            row = (await db.execute(
+                select(Job.status).where(Job.id == job_id)
+            )).scalar_one_or_none()
+        return row == "cancelled"
+    except Exception:
+        return False

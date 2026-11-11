@@ -3,7 +3,7 @@
 """REST /api/settings — user settings CRUD + credential testing + OAuth callbacks."""
 import logging
 from datetime import datetime
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -25,6 +25,7 @@ class SettingsResponse(BaseModel):
     # AI provider preference (BYOK)
     ai_provider: str = "openai"
     ai_model: Optional[str] = None
+    ai_base_url: Optional[str] = None  # OpenAI-compatible provider only; not a secret
     ai_api_key_set: bool = False  # masked — never returns the actual key
 
     # Service API keys (BYOK) — booleans only, never the plaintext key
@@ -45,7 +46,7 @@ class SettingsResponse(BaseModel):
     caption_enabled: bool = True
     music_enabled: bool = True
     music_genre: str = "lofi"
-    music_volume_db: float = -20.0
+    music_volume_db: float = -14.0
     upload_to_youtube: bool = True
     upload_to_tiktok: bool = False
     tiktok_default_privacy: str = "PUBLIC_TO_EVERYONE"
@@ -58,6 +59,7 @@ class SettingsUpdate(BaseModel):
     # AI provider preference (BYOK)
     ai_provider: Optional[str] = None
     ai_model: Optional[str] = None
+    ai_base_url: Optional[str] = None  # empty string clears
     ai_api_key: Optional[str] = None  # plaintext on input — encrypted before storage
 
     # Service API keys (BYOK) — plaintext on input, encrypted before storage.
@@ -95,6 +97,7 @@ async def get_settings():
     return SettingsResponse(
         ai_provider=s.ai_provider or "openai",
         ai_model=s.ai_model,
+        ai_base_url=s.ai_base_url,
         ai_api_key_set=bool(s.ai_api_key_encrypted),
         youtube_api_key_set=bool(s.youtube_api_key_encrypted),
         douyin_cookie_set=bool(s.douyin_cookie_encrypted),
@@ -109,7 +112,7 @@ async def get_settings():
         caption_enabled=s.caption_enabled if s.caption_enabled is not None else True,
         music_enabled=s.music_enabled if s.music_enabled is not None else True,
         music_genre=s.music_genre or "lofi",
-        music_volume_db=s.music_volume_db if s.music_volume_db is not None else -20.0,
+        music_volume_db=s.music_volume_db if s.music_volume_db is not None else -14.0,
         upload_to_youtube=s.upload_to_youtube if s.upload_to_youtube is not None else True,
         upload_to_tiktok=s.upload_to_tiktok or False,
         tiktok_default_privacy=s.tiktok_default_privacy or "PUBLIC_TO_EVERYONE",
@@ -119,6 +122,21 @@ async def get_settings():
 @router.post("/settings", response_model=SettingsResponse)
 async def update_settings(update: SettingsUpdate):
     """Update user settings. Keys are encrypted before saving."""
+    from backend.core.ai_provider import AIProvider, normalize_base_url
+
+    # Validate before touching the DB so a bad value saves nothing.
+    if update.ai_provider is not None:
+        try:
+            AIProvider(update.ai_provider)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Unknown AI provider: {update.ai_provider}")
+    base_url = None
+    if update.ai_base_url is not None:
+        try:
+            base_url = normalize_base_url(update.ai_base_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(UserSettings).where(UserSettings.user_id == "local")
@@ -133,6 +151,8 @@ async def update_settings(update: SettingsUpdate):
             s.ai_provider = update.ai_provider
         if update.ai_model is not None:
             s.ai_model = update.ai_model or None
+        if update.ai_base_url is not None:
+            s.ai_base_url = base_url or None
         if update.ai_api_key is not None:
             # Empty string clears the stored key; otherwise encrypt + store
             s.ai_api_key_encrypted = encrypt(update.ai_api_key) if update.ai_api_key else None
@@ -357,6 +377,13 @@ async def get_health():
     from backend.services.youtube_quota import _usage_today, DAILY_LIMIT
     health["youtube_quota"] = {"used": _usage_today.get("count", 0), "limit": DAILY_LIMIT}
 
+    # Occupancy of the download / transcription thread pools. A non-zero
+    # `abandoned` is the one clear "this process wants a restart" signal: a
+    # stalled download or Whisper call that was given up on is still holding
+    # its worker thread (Python cannot kill a thread).
+    from backend.core.executors import all_pool_stats
+    health["thread_pools"] = all_pool_stats()
+
     return health
 
 
@@ -390,3 +417,91 @@ async def open_folder(body: dict):
         return {"ok": True, "path": str(target)}
     except Exception as e:
         return {"ok": False, "error": str(e), "path": str(target)}
+
+
+# ── Motion Graphics (HyperFrames) — on-demand Node plugin ─────────────────────
+# Nothing motion-related ships in the base install. The portable Node runtime
+# and the HyperFrames npm package are downloaded on opt-in and live entirely in
+# the user's data dir, so the feature can be added and removed without touching
+# the app. Rendering is local (headless Chrome + FFmpeg) and costs nothing.
+
+@router.get("/settings/motion-graphics/status")
+async def motion_graphics_status():
+    """Plugin install state for the Settings card to poll (every 2s)."""
+    from backend.services.hyperframes_service import HyperFramesService
+    return HyperFramesService.get_install_state()
+
+
+@router.post("/settings/motion-graphics/install")
+async def motion_graphics_install():
+    """Trigger the plugin install (portable Node + npm install) in the
+    background. Idempotent; returns immediately. The UI polls status for
+    progress."""
+    from backend.services.hyperframes_service import HyperFramesService
+    return await HyperFramesService.install_plugin()
+
+
+@router.post("/settings/motion-graphics/uninstall")
+async def motion_graphics_uninstall():
+    """Remove the entire motion/ plugin dir."""
+    from backend.services.hyperframes_service import HyperFramesService
+    return await HyperFramesService.uninstall_plugin()
+
+
+@router.post("/settings/motion-graphics/test")
+async def motion_graphics_test():
+    """End-to-end smoke render of the bundled kinetic-hook template.
+
+    Confirms the whole chain (portable Node → HyperFrames CLI → headless Chrome
+    → FFmpeg) still produces a real MP4. The status is always 200 — the `ok`
+    flag carries the verdict, so the UI renders a result rather than an error.
+    """
+    import time as _time
+    from backend.services.hyperframes_service import HyperFramesService
+    from backend.services.motion_render_service import MotionRenderService
+
+    if not HyperFramesService.is_installed():
+        return {
+            "ok": False, "latency_ms": 0, "output_size_kb": None,
+            "error": "not_installed",
+            "detail": "Motion Graphics isn't installed yet. Click Install above first.",
+        }
+
+    start = _time.monotonic()
+    try:
+        out = await MotionRenderService.render(
+            template_id="kinetic_hook",
+            variables={
+                "kicker": "MOTION GRAPHICS",
+                "title": "It Works",
+                "subtitle": "rendered locally",
+                "accent": "#ffd60a",
+                "bg": "#0b0b14",
+            },
+            aspect="9:16",
+            # A verification render, not a deliverable: draft quality and no
+            # supersample keep it fast.
+            quality="draft",
+            supersample=False,
+        )
+        latency_ms = round((_time.monotonic() - start) * 1000)
+        size_kb = round(out.stat().st_size / 1024)
+        # Smoke test only — don't keep the output around.
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {
+            "ok": True, "latency_ms": latency_ms,
+            "output_size_kb": size_kb, "error": None, "detail": None,
+        }
+    except Exception as e:
+        latency_ms = round((_time.monotonic() - start) * 1000)
+        logger.info(
+            "Motion Graphics smoke test failed in %dms: %s: %s",
+            latency_ms, type(e).__name__, str(e)[:200],
+        )
+        return {
+            "ok": False, "latency_ms": latency_ms, "output_size_kb": None,
+            "error": type(e).__name__, "detail": str(e)[:200],
+        }
